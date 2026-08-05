@@ -34,26 +34,26 @@ jobs:
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
     - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6  # v1.16.1
-    - name: Cache cargo deps (cli)
+    - name: Cache cargo deps
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
       with:
         path: |
           ~/.cargo/registry/index/
           ~/.cargo/registry/cache/
           ~/.cargo/git/db/
-          cli/target/
-        key: cargo-cli-${{ runner.os }}-${{ hashFiles('cli/Cargo.lock') }}
+          target/
+        key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
         restore-keys: |
-          cargo-cli-${{ runner.os }}-
+          cargo-${{ runner.os }}-
     - name: Build CLI (release)
-      run: cd cli && cargo build --release
+      run: cargo build --release
     - name: Upload CLI binary
       # upload-artifact@v4 uses zip and does NOT preserve Unix +x. Consumers
       # must chmod +x after download.
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
       with:
         name: tdx-measure-cli
-        path: cli/target/release/tdx-measure
+        path: target/release/tdx-measure
         if-no-files-found: error
         retention-days: 7
 
@@ -69,7 +69,7 @@ jobs:
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
     - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6  # v1.16.1
-    - name: Cache cargo deps (lib)
+    - name: Cache cargo deps
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
       with:
         path: |
@@ -77,9 +77,9 @@ jobs:
           ~/.cargo/registry/cache/
           ~/.cargo/git/db/
           target/
-        key: cargo-lib-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+        key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
         restore-keys: |
-          cargo-lib-${{ runner.os }}-
+          cargo-${{ runner.os }}-
     - name: Cache OVMF.fd
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
       with:
@@ -103,7 +103,7 @@ jobs:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
     - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6  # v1.16.1
     - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
-    - name: Cache cargo deps (lib)
+    - name: Cache cargo deps
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
       with:
         path: |
@@ -111,9 +111,9 @@ jobs:
           ~/.cargo/registry/cache/
           ~/.cargo/git/db/
           target/
-        key: cargo-lib-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+        key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
         restore-keys: |
-          cargo-lib-${{ runner.os }}-
+          cargo-${{ runner.os }}-
     - name: Cache OVMF.fd
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
       with:
@@ -126,10 +126,10 @@ jobs:
       uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
       with:
         name: tdx-measure-cli
-        path: cli/target/release/
+        path: target/release/
     - name: Make CLI executable
       # upload-artifact@v4's zip layer drops the +x bit; restore it.
-      run: chmod +x cli/target/release/tdx-measure
+      run: chmod +x target/release/tdx-measure
     - name: Run round-trip regen tests
       # `--ignored` runs the gated tests/regen.rs. The Canonical-defaults
       # fixture uses `accel: "kvm"` and is auto-skipped on KVM-less runners
@@ -147,10 +147,10 @@ jobs:
       uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
       with:
         name: tdx-measure-cli
-        path: cli/target/release/
+        path: target/release/
     - name: Make CLI executable
       # upload-artifact@v4's zip layer drops the +x bit; restore it.
-      run: chmod +x cli/target/release/tdx-measure
+      run: chmod +x target/release/tdx-measure
     - name: Create Release
       # Use the first-party `gh` CLI (pre-installed on every GitHub-hosted
       # runner) instead of a third-party release action. `gh release create`
@@ -161,6 +161,6 @@ jobs:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         gh release create "${GITHUB_REF_NAME}" \
-          cli/target/release/tdx-measure \
+          target/release/tdx-measure \
           --title "${GITHUB_REF_NAME}" \
           --generate-notes

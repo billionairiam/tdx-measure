@@ -20,10 +20,10 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/.." && pwd)"
 fixtures="$here/fixtures"
-tdx_measure="$repo/cli/target/release/tdx-measure"
+tdx_measure="$repo/target/release/tdx-measure"
 
 if [[ ! -x "$tdx_measure" ]]; then
-    echo "build the CLI first: (cd cli && cargo build --release)" >&2
+    echo "build the CLI first: cargo build --release" >&2
     exit 1
 fi
 if [[ ! -f "$fixtures/OVMF.fd" ]]; then

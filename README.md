@@ -268,9 +268,13 @@ sudo apt-get install jq
 
 ## Build the project
 
+The two crates (`tdx-measure` library at the repo root and `tdx-measure-cli` under `cli/`) form a single cargo workspace, so one command builds both and the binary lands in the shared `target/` directory:
+
 ```
 cargo build --release
 ```
+
+On success, the CLI build result is located at `target/release/tdx-measure`.
 
 ## Install the CLI tool
 

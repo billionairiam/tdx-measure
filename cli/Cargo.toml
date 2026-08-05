@@ -1,7 +1,8 @@
 [package]
 name = "tdx-measure-cli"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "tdx-measure"
@@ -10,8 +11,8 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 tdx-measure = { path = ".." }
-anyhow = "1.0"
-hex = "0.4"
-fs-err = "3.2"
-serde_json = "1.0"
+anyhow.workspace = true
+hex.workspace = true
+fs-err.workspace = true
+serde_json.workspace = true
 tracing-subscriber = "0.3"
