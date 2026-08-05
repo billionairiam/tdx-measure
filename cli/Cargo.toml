@@ -1,5 +1,6 @@
 [package]
 name = "tdx-measure-cli"
+description = "Command-line interface for calculating measurements of Intel TDX-protected VMs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
