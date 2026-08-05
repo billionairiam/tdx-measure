@@ -15,8 +15,7 @@ serde_json = "1.0"
 
 [package]
 name = "tdx-measure"
-authors = ["Your Name <your.email@example.com>"]
-description = "A CLI tool for calculating TDX measurements"
+description = "A library for calculating measurements of Intel TDX-protected VMs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
