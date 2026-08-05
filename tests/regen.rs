@@ -23,11 +23,9 @@ fn fixtures_dir() -> PathBuf {
 }
 
 fn cli_binary() -> PathBuf {
-    // cargo's tests put the per-package target dir at
-    // $CARGO_MANIFEST_DIR/cli/target/release/tdx-measure when the cli subcrate
-    // is built; fall back to PATH lookup if not pre-built.
+    // Both crates share the workspace target dir, so the CLI lands at $CARGO_MANIFEST_DIR/target/release/tdx-measure.
+    // Fall back to PATH lookup if not pre-built.
     let candidate = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("cli")
         .join("target")
         .join("release")
         .join("tdx-measure");
