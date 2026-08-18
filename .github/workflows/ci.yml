@@ -45,6 +45,13 @@ jobs:
         key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
         restore-keys: |
           cargo-${{ runner.os }}-
+    - name: Check Cargo manifest sorting
+      # cargo-sort is not shipped with the toolchain, so it is installed here.
+      # Pinned so a new upstream release cannot turn a green PR red on its own.
+      # --locked keeps cargo-sort's own dependency resolution reproducible.
+      run: |
+        cargo install cargo-sort --version 2.1.4 --locked
+        cargo sort --check --workspace
     - name: Build CLI (release)
       run: cargo build --release
     - name: Upload CLI binary
