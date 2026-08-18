@@ -1,3 +1,10 @@
+[package]
+name = "tdx-measure"
+description = "A library for calculating measurements of Intel TDX-protected VMs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
 [workspace]
 members = ["cli"]
 default-members = [".", "cli"]
@@ -13,27 +20,20 @@ fs-err = "3.2"
 hex = "0.4"
 serde_json = "1.0"
 
-[package]
-name = "tdx-measure"
-description = "A library for calculating measurements of Intel TDX-protected VMs"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json.workspace = true
-serde-human-bytes = "0.1"
-hex.workspace = true
-thiserror = "2.0"
-sha2 = "0.10"
 anyhow.workspace = true
-object = "0.38"
-hex-literal = "1.1"
-fs-err.workspace = true
 bon = "3.8"
+fs-err.workspace = true
+hex.workspace = true
+hex-literal = "1.1"
 log = "0.4"
+object = "0.38"
+serde = { version = "1.0", features = ["derive"] }
+serde-human-bytes = "0.1"
+serde_json.workspace = true
+sha2 = "0.10"
 tempfile = "3.27.0"
+thiserror = "2.0"
 
 [dev-dependencies]
 serde_json.workspace = true
