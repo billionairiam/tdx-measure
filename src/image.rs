@@ -65,23 +65,66 @@ fn guestfish_download(qcow2_path: &str, source_path: &str) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-/// Extracts GPT event data in the format used by EV_EFI_GPT_EVENT
-fn extract_gpt_event_data(qcow2_path: &str) -> Result<Vec<u8>> {
-    // Extract GPT header from LBA 1 (skip MBR at LBA 0)
+/// Helper function to read raw bytes from the disk inside a qcow2 using guestfish
+fn guestfish_pread_device(qcow2_path: &str, len: usize, offset: u64) -> Result<Vec<u8>> {
     let output = Command::new(guestfish_bin()?)
         .args(&[
             "--ro", "-a", qcow2_path,
             "run", ":",
-            "pread-device", "/dev/sda", "512", "512"  // Read LBA 1 (GPT header)
+            "pread-device", "/dev/sda", &len.to_string(), &offset.to_string()
         ])
         .output()
-        .context("Failed to extract GPT header")?;
+        .context(format!("Failed to read {} bytes at offset {} from {}", len, offset, qcow2_path))?;
 
     if !output.status.success() {
-        bail!("Failed to extract GPT header: {}", String::from_utf8_lossy(&output.stderr));
+        bail!("Failed to read {} bytes at offset {} from {}: {}", len, offset, qcow2_path, String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(output.stdout)
+}
+
+/// Where the guest boot chain (GPT, shim, grub, initrd) is read from.
+#[derive(Debug, Clone, Copy)]
+pub enum ImageSource<'a> {
+    /// A qcow2 disk image on the host, accessed via guestfish.
+    Qcow2(&'a str),
+    /// The running guest itself: `disk` is the raw boot disk (e.g. `/dev/vda`)
+    /// and `rootfs` is the mounted guest filesystem root (e.g. `/`).
+    Local { disk: &'a str, rootfs: &'a str },
+}
+
+impl ImageSource<'_> {
+    /// Read a file from the guest filesystem (absolute guest path).
+    fn read_file(&self, guest_path: &str) -> Result<Vec<u8>> {
+        match self {
+            ImageSource::Qcow2(qcow2) => guestfish_download(qcow2, guest_path),
+            ImageSource::Local { rootfs, .. } => {
+                let path = Path::new(rootfs).join(guest_path.trim_start_matches('/'));
+                fs_err::read(&path).context(format!("Failed to read {}", path.display()))
+            }
+        }
     }
 
-    let gpt_header = output.stdout;
+    /// Read `len` raw bytes at byte `offset` from the boot disk.
+    fn read_disk(&self, len: usize, offset: u64) -> Result<Vec<u8>> {
+        match self {
+            ImageSource::Qcow2(qcow2) => guestfish_pread_device(qcow2, len, offset),
+            ImageSource::Local { disk, .. } => {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut f = fs_err::File::open(disk)?;
+                f.seek(SeekFrom::Start(offset))?;
+                let mut buf = vec![0u8; len];
+                f.read_exact(&mut buf)
+                    .context(format!("Failed to read {} bytes at offset {} from {}", len, offset, disk))?;
+                Ok(buf)
+            }
+        }
+    }
+}
+
+/// Extracts GPT event data in the format used by EV_EFI_GPT_EVENT
+fn extract_gpt_event_data(source: &ImageSource) -> Result<Vec<u8>> {
+    // Extract GPT header from LBA 1 (skip MBR at LBA 0)
+    let gpt_header = source.read_disk(512, 512).context("Failed to extract GPT header")?;
 
     // Parse GPT header
     if gpt_header.len() < 92 {
@@ -106,20 +149,8 @@ fn extract_gpt_event_data(qcow2_path: &str) -> Result<Vec<u8>> {
     let entries_offset = partition_entry_lba * 512;
     let entries_length = sectors_needed * 512;
 
-    let output = Command::new(guestfish_bin()?)
-        .args(&[
-            "--ro", "-a", qcow2_path,
-            "run", ":",
-            "pread-device", "/dev/sda", &entries_length.to_string(), &entries_offset.to_string()
-        ])
-        .output()
+    let all_entries = source.read_disk(entries_length, entries_offset)
         .context("Failed to extract GPT entries")?;
-
-    if !output.status.success() {
-        bail!("Failed to extract GPT entries: {}", String::from_utf8_lossy(&output.stderr));
-    }
-
-    let all_entries = output.stdout;
 
     // Filter valid partition entries (non-zero PartitionTypeGUID)
     let mut valid_entries = Vec::new();
@@ -199,13 +230,13 @@ fn extract_kernel_version_from_cmdline(cmdline: &str) -> Result<String> {
     bail!("Could not extract kernel version from command line: {}", cmdline);
 }
 
-/// Main function to measure RTMR1 from a qcow2 disk image
-pub fn measure_rtmr1_from_qcow2(qcow2_path: &str, include_separator: bool) -> Result<Vec<u8>> {
+/// Main function to measure RTMR1 from a guest disk image
+pub fn measure_rtmr1_from_image(source: &ImageSource, include_separator: bool) -> Result<Vec<u8>> {
 
     // Extract bootloader files
-    let gpt_data = extract_gpt_event_data(qcow2_path)?;
-    let shim_data = guestfish_download(qcow2_path, "/boot/efi/EFI/ubuntu/shimx64.efi")?;
-    let grub_data = guestfish_download(qcow2_path, "/boot/efi/EFI/ubuntu/grubx64.efi")?;
+    let gpt_data = extract_gpt_event_data(source)?;
+    let shim_data = source.read_file("/boot/efi/EFI/ubuntu/shimx64.efi")?;
+    let grub_data = source.read_file("/boot/efi/EFI/ubuntu/grubx64.efi")?;
 
     // Compute hashes of the bootloader components
     let gpt_hash = measure_sha384(&gpt_data);
@@ -230,14 +261,14 @@ pub fn measure_rtmr1_from_qcow2(qcow2_path: &str, include_separator: bool) -> Re
 }
 
 /// Measures RTMR2 using actual MOK variable data extracted from shim
-pub fn measure_rtmr2_from_qcow2(qcow2_path: &str, cmdline: &str, ref_mok_list: Option<&str>, ref_mok_list_trusted: Option<&str>, ref_mok_list_x: Option<&str>) -> Result<Vec<u8>> {
+pub fn measure_rtmr2_from_image(source: &ImageSource, cmdline: &str, ref_mok_list: Option<&str>, ref_mok_list_trusted: Option<&str>, ref_mok_list_x: Option<&str>) -> Result<Vec<u8>> {
 
     // Extract kernel version from command line and construct initrd path
     let kernel_version = extract_kernel_version_from_cmdline(cmdline)?;
     let initrd_path = format!("/boot/initrd.img-{}", kernel_version);
 
     // Extract initrd
-    let initrd_data = guestfish_download(qcow2_path, &initrd_path)?;
+    let initrd_data = source.read_file(&initrd_path)?;
 
     // Compute RTMR2 log. MOK variables are optional; skip any that are absent.
     let mut rtmr2_log = Vec::new();
@@ -255,4 +286,43 @@ pub fn measure_rtmr2_from_qcow2(qcow2_path: &str, cmdline: &str, ref_mok_list: O
 
     debug_print_log("RTMR2", &rtmr2_log);
     Ok(measure_log(&rtmr2_log))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_source_reads_gpt_and_files() {
+        let dir = std::env::temp_dir().join(format!("tdx_measure_local_src_{}", std::process::id()));
+        let efi = dir.join("boot/efi/EFI/ubuntu");
+        fs_err::create_dir_all(&efi).unwrap();
+        fs_err::write(efi.join("shimx64.efi"), b"shim").unwrap();
+
+        // GPT header at LBA 1, 4 x 128-byte entries at LBA 2, entries 0 and 2 valid.
+        let mut disk = vec![0u8; 512 * 3];
+        disk[512..520].copy_from_slice(b"EFI PART");
+        disk[512 + 72..512 + 80].copy_from_slice(&2u64.to_le_bytes());
+        disk[512 + 80..512 + 84].copy_from_slice(&4u32.to_le_bytes());
+        disk[512 + 84..512 + 88].copy_from_slice(&128u32.to_le_bytes());
+        disk[1024] = 0xaa;
+        disk[1024 + 256] = 0xbb;
+        let disk_path = dir.join("disk.raw");
+        fs_err::write(&disk_path, &disk).unwrap();
+
+        let source = ImageSource::Local {
+            disk: disk_path.to_str().unwrap(),
+            rootfs: dir.to_str().unwrap(),
+        };
+        assert_eq!(source.read_file("/boot/efi/EFI/ubuntu/shimx64.efi").unwrap(), b"shim");
+
+        let gpt = extract_gpt_event_data(&source).unwrap();
+        let _ = fs_err::remove_dir_all(&dir);
+
+        assert_eq!(gpt.len(), 92 + 8 + 2 * 128);
+        assert_eq!(&gpt[..92], &disk[512..604]);
+        assert_eq!(u64::from_le_bytes(gpt[92..100].try_into().unwrap()), 2);
+        assert_eq!(gpt[100], 0xaa);
+        assert_eq!(gpt[228], 0xbb);
+    }
 }

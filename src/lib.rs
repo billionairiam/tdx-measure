@@ -131,6 +131,13 @@ pub struct MeasureConfig {
     // Indirect boot fields
     #[serde(skip_serializing_if = "is_none_or_empty")]
     pub qcow2: Option<String>,
+    /// Raw boot disk (e.g. `/dev/vda`) used instead of `qcow2` when measuring
+    /// from inside the running guest.
+    #[serde(default, skip_serializing_if = "is_none_or_empty")]
+    pub disk: Option<String>,
+    /// Guest filesystem root used with `disk` (defaults to `/`).
+    #[serde(default, skip_serializing_if = "is_none_or_empty")]
+    pub rootfs: Option<String>,
     #[serde(skip_serializing_if = "is_none_or_empty")]
     pub mok_list: Option<String>,
     #[serde(skip_serializing_if = "is_none_or_empty")]

@@ -83,6 +83,8 @@ fn machine_from_grouped(g: &Grouped, boot_mode: &str, tdvf_before_202411: bool) 
         initrd: None,
         cmdline: opt(indirect, "cmdline"),
         qcow2: opt(indirect, "[Path to qcow2 image]"),
+        disk: None,
+        rootfs: None,
         mok_list: opt(indirect, "[Path to mok_list]"),
         mok_list_trusted: opt(indirect, "[Path to mok_list_trusted]"),
         mok_list_x: opt(indirect, "[Path to mok_list_x]"),

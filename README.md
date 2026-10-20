@@ -189,6 +189,9 @@ Create `metadata.json` file with the below metadata:
   - `qcow2`: Path to guest OS disk image in QCOW2 format.
     The image contains the guest filesystem with the bootloader chain (e.g., SHIM and Grub) and a kernel.
     The image can be created by following [these instructions](https://github.com/canonical/tdx/tree/main?tab=readme-ov-file#5-create-td-image).
+  - `disk` *(alternative to `qcow2`)*: Raw boot disk of the running guest (e.g. `/dev/vda`), used when running `tdx-measure` **inside the TD**.
+    The GPT is read from this device, and shim/grub/initrd are read from the local filesystem under `rootfs`. Requires read access to the device (typically root). `qcow2` and `disk` are mutually exclusive.
+  - `rootfs` *(optional, used with `disk`, default `/`)*: Guest filesystem root from which `/boot/efi/EFI/ubuntu/{shimx64,grubx64}.efi` and `/boot/initrd.img-<version>` are read.
   - `cmdline`: Kernel command line parameters.
     These parameters can be obtained by executing `cat /proc/cmdline` inside a TD, which is configured identically to the target configuration.
   - `mok_list`: Path to file containing a Machine Owner Key (MOK) list for Secure Boot.

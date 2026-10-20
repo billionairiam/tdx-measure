@@ -53,6 +53,8 @@ impl Machine {
             mc.kernel = mc.kernel.as_ref().map(|p| resolve(base_dir, p));
             mc.initrd = mc.initrd.as_ref().map(|p| resolve(base_dir, p));
             mc.qcow2 = mc.qcow2.as_ref().map(|p| resolve(base_dir, p));
+            mc.disk = mc.disk.as_ref().map(|p| resolve(base_dir, p));
+            mc.rootfs = mc.rootfs.as_ref().map(|p| resolve(base_dir, p));
             mc.mok_list = mc.mok_list.as_ref().map(|p| resolve(base_dir, p));
             mc.mok_list_trusted = mc.mok_list_trusted.as_ref().map(|p| resolve(base_dir, p));
             mc.mok_list_x = mc.mok_list_x.as_ref().map(|p| resolve(base_dir, p));
@@ -161,16 +163,27 @@ impl Machine {
             let rtmr2 = kernel::measure_rtmr2_direct(initrd_path, cmdline)?;
             Ok((rtmr1, rtmr2))
         } else {
-            let qcow2_path = mc.qcow2.as_deref()
-                .ok_or_else(|| anyhow!("qcow2 is required for indirect boot"))?;
+            let source = match (mc.qcow2.as_deref(), mc.disk.as_deref()) {
+                (Some(_), Some(_)) => {
+                    return Err(anyhow!("qcow2 and disk are mutually exclusive for indirect boot"));
+                }
+                (Some(qcow2), None) => image::ImageSource::Qcow2(qcow2),
+                (None, Some(disk)) => image::ImageSource::Local {
+                    disk,
+                    rootfs: mc.rootfs.as_deref().unwrap_or("/"),
+                },
+                (None, None) => {
+                    return Err(anyhow!("indirect boot requires either qcow2 (host) or disk (in-guest)"));
+                }
+            };
             let mok_list = mc.mok_list.as_deref();
             let mok_list_trusted = mc.mok_list_trusted.as_deref();
             let mok_list_x = mc.mok_list_x.as_deref();
             let cmdline = mc.cmdline.as_deref().unwrap_or("");
 
-            let rtmr1 = image::measure_rtmr1_from_qcow2(qcow2_path, rtmr1_separator)?;
-            let rtmr2 = image::measure_rtmr2_from_qcow2(
-                qcow2_path, cmdline, mok_list, mok_list_trusted, mok_list_x,
+            let rtmr1 = image::measure_rtmr1_from_image(&source, rtmr1_separator)?;
+            let rtmr2 = image::measure_rtmr2_from_image(
+                &source, cmdline, mok_list, mok_list_trusted, mok_list_x,
             )?;
             Ok((rtmr1, rtmr2))
         }
