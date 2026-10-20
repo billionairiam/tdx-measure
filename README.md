@@ -16,27 +16,39 @@ This project is a fork of dstack-mr from the [Dstack-TEE/dstack](https://github.
 
 ```tdx-measure [OPTIONS] <METADATA>```
 
+Running `tdx-measure <METADATA>` (or the explicit `tdx-measure measure <METADATA>`
+subcommand) computes the measurements. The tool also provides `gen-metadata`
+(build a metadata skeleton from a QEMU command line) and `gen-acpi` (generate the
+ACPI tables blob) subcommands.
+
 ### Arguments:
 `<METADATA>` Path to metadata json file (see format lower down)
 
 ### Options
 ```
-      --direct-boot <DIRECT_BOOT>           Enable direct boot (overrides JSON configuration) [possible values: true, false]
-      --json                                Output JSON
-      --json-file <JSON_FILE>               Output JSON to file
-      --platform-only                       Compute MRTD and RTMR0 only
-      --runtime-only                        Compute RTMR1 and RTMR2 only
-      --transcript <TRANSCRIPT>             Generate a human-readable transcript of all metadata files and write to the specified file
-      --create-acpi-tables <DISTRIBUTION> [<QEMU_VERSION>]
-                                            Generate ACPI tables for direct boot mode. Only valid with direct boot.
-                                            <DISTRIBUTION> in {ubuntu:25.04, ubuntu:26.04}.
-                                            <QEMU_VERSION> overrides the pinned QEMU source-package version for the given distribution
-                                            (pass `""` to fetch the current main-archive tip).
-  -h, --help                                Print help
-  -V, --version                             Print version
+      --json                       Output JSON
+      --json-file <JSON_FILE>      Output JSON to file
+      --transcript <TRANSCRIPT>    Generate a human-readable transcript of all metadata files and write to the specified file
+  -h, --help                       Print help
+  -V, --version                    Print version
 ```
 
-WARNING: when running with `--runtime-only`, the tool will assume a VM memory size higher that 2.75GB.
+The boot mode (`direct` vs `indirect`) is determined by the `bootmode` field inside `measure_config` in the metadata file.
+
+`measure` computes all four registers (MRTD, RTMR0–2) and therefore requires the
+runtime inputs (kernel/initrd or qcow2). It reads the ACPI tables from the
+`acpi_tables_bin` path in the metadata; generate that file first with `gen-acpi`
+(or supply an externally-extracted one).
+
+### Generating metadata from a QEMU command line
+
+The `gen-metadata` subcommand parses a raw QEMU command line (via the bundled `qcparser` library) and emits a `metadata.json` skeleton:
+
+```
+tdx-measure gen-metadata --qemu-command <FILE> --boot-mode <direct|indirect> [--tdvf-after-202411] [-o metadata.json]
+```
+
+`--qemu-command` points to a file containing the QEMU invocation. `--boot-mode` selects the boot chain and seeds the matching `measure_config` placeholder paths. `--tdvf-after-202411` marks the firmware as the 202411 build or newer (otherwise older firmware is assumed). The parsed VM shape is written to `qemu_options`; fill in the placeholder measurement-input paths afterwards.
 
 ### Direct Boot
 
@@ -46,15 +58,16 @@ Create `metadata.json` file with the below metadata:
 
 ```
 {
-  "boot_config": {
-    "cpus": 16,
+  "qemu_options": {
+    "smp": "16",
     "memory": "2G",
-    "bios": "[path to OVMF.fd]",
-    "acpi_tables": "[path to acpi_tables.bin]",
-    "rsdp": "[path to rsdp.bin]",
-    "table_loader": "[path to table_loader.bin]"
+    "bios": "[path to OVMF.fd]"
   },
-  "direct": {
+  "measure_config": {
+    "bootmode": "direct",
+    "acpi_tables_bin": "[path to acpi_tables.bin]",
+    "rsdp": "[path to rsdp.bin]",
+    "table_loader": "[path to table_loader.bin]",
     "kernel": "[path to vmlinuz]",
     "initrd": "[path to initrd]",
     "cmdline": "root=/dev/sda1 console=ttyS0"
@@ -64,36 +77,31 @@ Create `metadata.json` file with the below metadata:
 
 #### Metadata Field Descriptions
 
-- `boot_config`: Platform configuration used to compute MRTD and RTMR[0]
-  - `cpus`: Number of virtual CPUs allocated to the TD.
+- `qemu_options`: VM shape used to compute MRTD and RTMR[0] and (when generating ACPI tables) to launch QEMU.
+  - `smp` *(optional)*: value passed verbatim to `-smp`, either a bare CPU count (`"16"`) or a full topology (`"48,sockets=1,dies=1,cores=24,threads=2"`). The topology affects the guest ACPI (MADT/SRAT), so preserve it verbatim. Defaults to a single CPU when absent.
   - `memory`: The amount of memory allocated to the TD (e.g., "2G" for 2 gigabytes).
   - `bios`: Path to file (e.g., `OVMF.fd`) containing a virtual BIOS, which is used to boot the TD image.
     The file can be obtained by setting up the host OS following [these instructions](https://github.com/canonical/tdx/tree/main?tab=readme-ov-file#4-setup-host-os) and retrieving it from `/usr/share/ovmf/OVMF.fd`.
-  - `acpi_tables`: Path to a file containing ACPI tables, which describe the hardware configuration and device tree that the TD uses to discover and configure hardware.
-    By using the `--create-acpi-tables` flag of the `tdx-measure` tool, the ACPI tables are generated automatically and stored to a file at the path provided by `acpi_tables`.
+- `measure_config`: Measurement inputs. `bootmode` is `direct`.
+  - `tdvf_before_202411` *(optional, default `true`)*: set to `false` when the TDVF firmware is the 202411 build or newer. When true, the separator event from RTMR1 is moved to the end of the RTMR0 measurement log.
+  - `acpi_tables_bin`: Path to a file containing ACPI tables, which describe the hardware configuration and device tree that the TD uses to discover and configure hardware.
+    By using the `gen-acpi` subcommand of the `tdx-measure` tool, the ACPI tables are generated automatically and stored to a file at the path provided by `acpi_tables_bin`.
     Alternatively, a file containing the ACPI tables can be extracted by running the [`extract_config_files.py`](extract_config_files.py) script inside a TD, which is configured identically to the target configuration.
   - `rsdp`: Path to a file containing a Root System Description Pointer (RSDP), which is an ACPI data structure that provides the address of the RSDT/XSDT table.
-    By using the `--create-acpi-tables` flag of the `tdx-measure` tool, the ACPI tables are generated automatically and the RSDP is derived from these tables automatically.
-    In this case, this flag is not needed.
+    When omitted, the RSDP is derived automatically from the ACPI tables blob.
     Alternatively, a file containing the RSDP can be extracted by running the [`extract_config_files.py`](extract_config_files.py) script inside a TD, which is configured identically to the target configuration.
-    In this case, the extracted file can be provided with this flag.
   - `table_loader`: Path to a file containing a ACPI table loader, which contains QEMU-specific commands for loading and patching ACPI tables.
-    By using the `--create-acpi-tables` flag of the `tdx-measure` tool, the ACPI tables are generated automatically and the ACPI table loader is derived from these tables automatically.
-    In this case, this flag is not needed.
-    Alternatively, a file containing the RSDP can be extracted by running the [`extract_config_files.py`](extract_config_files.py) script inside a TD, which is configured identically to the target configuration.
-    In this case, the extracted file can be provided with this flag.
+    When omitted, the ACPI table loader is derived automatically from the ACPI tables blob.
+    Alternatively, a file containing the table loader can be extracted by running the [`extract_config_files.py`](extract_config_files.py) script inside a TD, which is configured identically to the target configuration.
 
-- `qemu` *(optional)*: Generic QEMU shape descriptor consumed by `--create-acpi-tables`. Each field is a thin pass-through to QEMU. When present, the QEMU command is built from this block plus a minimal set of measurement-related core flags (`-smp ... -m ... -bios ... -nodefaults -vga none -nographic -no-reboot`). When absent, the tool falls back to the Canonical direct-boot args. Fields:
-  - `machine` *(required when block is present)*: value passed verbatim to `-machine`, e.g. `"q35,kernel_irqchip=split,memory-backend=mem0,smm=off,pic=off"`.
+- `qemu_options` *(extended fields, optional)*: Generic QEMU shape descriptor consumed by `gen-acpi`. Each field is a thin pass-through to QEMU. When `machine` is present, the QEMU command is built from this block plus a minimal set of measurement-related core flags (`-smp ... -m ... -bios ... -nodefaults -vga none -nographic -no-reboot`). When absent, the tool falls back to the Canonical direct-boot args. Fields:
+  - `machine`: value passed verbatim to `-machine`, e.g. `"q35,kernel_irqchip=split,memory-backend=mem0,smm=off,pic=off"`.
   - `cpu` *(optional, default `"host"`)*: value passed verbatim to `-cpu`. Use a named model with an explicit `phys-bits=N` (e.g. `"Skylake-Server,phys-bits=46"`) to make the run independent of the host CPU.
   - `accel` *(optional, default `"kvm"`)*: value passed verbatim to `-accel`. Use `"tcg"` to skip KVM (CI runners without `/dev/kvm`, ARM hosts via x86 emulation, …).
-  - `globals`: list of strings, each emitted as `-global <value>`.
-  - `objects`: list of strings, each emitted as `-object <value>`.
-  - `netdevs`: list of strings, each emitted as `-netdev <value>`.
+  - `globals`, `objects`, `numas`, `acpi_tables`, `netdevs`, `chardevs`, `blockdevs`, `drives`, `fw_cfg`: lists of strings, each emitted as the corresponding `-global` / `-object` / `-numa` / `-acpitable` / `-netdev` / `-chardev` / `-blockdev` / `-drive` / `-fw_cfg` argument.
   - `devices`: list of strings, each emitted as `-device <value>`. **Order is part of the API contract**: QEMU's PCI auto-slot assignment iterates `-device` arguments in command-line order and picks the lowest free slot, so `devices` must be authored in the same order as the reference launch you are mirroring. A `slot=N` argument on a `pcie-root-port` is only a hint and shifts if the slot is already taken by an earlier auto-assigned device. Order within `globals` / `objects` / `netdevs` / `fw_cfg` does not influence the ACPI tables.
-  - `fw_cfg`: list of strings, each emitted as `-fw_cfg <value>`.
 
-- `direct`: Direct boot specific configuration used to compute RTMR[1] and RTMR[2]
+- `measure_config` *(direct fields)*: Direct boot specific configuration used to compute RTMR[1] and RTMR[2]
   - `kernel`: Path to file (e.g., `vmlinuz`) of kernel image, which will be directly loaded and executed by OVMF.
     The file can be obtain by following [these instructions](https://github.com/canonical/tdx/tree/main/guest-tools/direct-boot#prerequisites).
   - `initrd`: Path to file (e.g., `initrd.img`) of initial RAM disk, which is a temporary root filesystem loaded into memory during boot, containing drivers and tools needed to mount the actual root filesystem.
@@ -106,22 +114,25 @@ These are calculated by the tool automatically.
 
 #### Generating ACPI tables
 
-When `--create-acpi-tables` is passed, the tool builds a small Docker image that
+The `gen-acpi` subcommand builds a small Docker image that
 patches QEMU to dump `etc/acpi/tables` and exits before TD entry. This requires
 a working `docker` (with buildx) and, when `accel: "kvm"` is in effect, KVM on
 the host. Each supported distribution pins a known-good QEMU source version
 (`1:9.2.1+ds-1ubuntu4+tdx2.0~ppa2` for `ubuntu:25.04`, `1:10.2.1+ds-1ubuntu4`
-for `ubuntu:26.04`) so the same metadata + CLI produces the same ACPI bytes
-regardless of when the regen runs. Pass an explicit version as the second
-positional value of `--create-acpi-tables` to override the pin (e.g. to validate
-an SRU), or `""` to opt into whatever `pull-lp-source` currently picks from the
-main archive:
+for `ubuntu:26.04`) so the same metadata produces the same ACPI bytes
+regardless of when the regen runs. Pass `--qemu-version` to override the pin
+(e.g. to validate an SRU), or `--qemu-version ""` to opt into whatever
+`pull-lp-source` currently picks from the main archive. The tables are written
+to the `acpi_tables_bin` path in the metadata:
 
 ```
---create-acpi-tables ubuntu:26.04                              # default pin
---create-acpi-tables ubuntu:26.04 1:10.2.1+ds-1ubuntu5         # explicit version
---create-acpi-tables ubuntu:26.04 ""                           # current main-archive tip
+tdx-measure gen-acpi <METADATA> --distribution ubuntu:26.04                                    # default pin
+tdx-measure gen-acpi <METADATA> --distribution ubuntu:26.04 --qemu-version 1:10.2.1+ds-1ubuntu5 # explicit version
+tdx-measure gen-acpi <METADATA> --distribution ubuntu:26.04 --qemu-version ""                   # current main-archive tip
 ```
+
+The dumper itself lives in the standalone `acpi-dump` library crate; the core
+`tdx-measure` measurement library carries no Docker/process dependencies.
 
 ### Indirect Boot
 
@@ -131,17 +142,18 @@ Create `metadata.json` file with the below metadata:
 
 ```
 {
-  "boot_config": {
-    "cpus": 32,
+  "qemu_options": {
+    "smp": "32",
     "memory": "10G",
-    "bios": "[path to OVMF.fd]",
-    "acpi_tables": "[path to acpi_tables.bin]",
+    "bios": "[path to OVMF.fd]"
+  },
+  "measure_config": {
+    "bootmode": "indirect",
+    "acpi_tables_bin": "[path to acpi_tables.bin]",
     "rsdp": "[path to rsdp.bin]",
     "table_loader": "[path to table_loader.bin]",
     "boot_order": "[path to BootOrder.bin]",
-    "path_boot_xxxx": "[path to directory containing Bootxxxx.bin files]"
-  },
-  "indirect": {
+    "path_boot_xxxx": "[path to directory containing Bootxxxx.bin files]",
     "qcow2": "[path to tdx-guest-ubuntu-25.04-generic.qcow2]",
     "cmdline": "console=ttyS0 root=/dev/vda1",
     "mok_list": "[path to MokList.bin]",
@@ -154,12 +166,14 @@ Create `metadata.json` file with the below metadata:
 
 #### Metadata Field Descriptions
 
-- `boot_config`: Platform configuration used to compute MRTD and RTMR[0]
+- `qemu_options`: VM shape used to compute MRTD and RTMR[0]
   - `cpus`: Number of virtual CPUs allocated to the TD.
   - `memory`: The amount of memory allocated to the TD (e.g., "2G" for 2 gigabytes).
   - `bios`: Path to file (e.g., `OVMF.fd`) containing a virtual BIOS, which is used to boot the TD image.
     The file can be obtained by setting up the host OS following [these instructions](https://github.com/canonical/tdx/tree/main?tab=readme-ov-file#4-setup-host-os) and retrieving it from `/usr/share/ovmf/OVMF.fd`.
-  - `acpi_tables`: Path to file containing ACPI tables, which describe the hardware configuration and device tree that the TD uses to discover and configure hardware.
+- `measure_config`: Measurement inputs. `bootmode` is `indirect`.
+  - `tdvf_before_202411` *(optional, default `true`)*: set to `false` when the TDVF firmware is the 202411 build or newer. When true, the separator event from RTMR1 is moved to the end of the RTMR0 measurement log.
+  - `acpi_tables_bin`: Path to file containing ACPI tables, which describe the hardware configuration and device tree that the TD uses to discover and configure hardware.
     The file can be extracted by running the [`extract_config_files.py`](extract_config_files.py) script inside a TD, which is configured identically to the target configuration.
   - `rsdp`: Path to file containing a Root System Description Pointer (RSDP), which is an ACPI data structure that provides the address of the RSDT/XSDT table.
     The file can be extracted by running the [`extract_config_files.py`](extract_config_files.py) script inside a TD, which is configured identically to the target configuration.
@@ -171,7 +185,7 @@ Create `metadata.json` file with the below metadata:
     Each variable defines a specific boot option with its device path and description.
     These files can be extracted by running the [`extract_config_files.py`](extract_config_files.py) script inside a TD, which is configured identically to the target configuration.
 
-- `indirect`: Indirect boot specific configuration used to compute RTMR[1] and RTMR[2]
+- `measure_config` *(indirect fields)*: used to compute RTMR[1] and RTMR[2]
   - `qcow2`: Path to guest OS disk image in QCOW2 format.
     The image contains the guest filesystem with the bootloader chain (e.g., SHIM and Grub) and a kernel.
     The image can be created by following [these instructions](https://github.com/canonical/tdx/tree/main?tab=readme-ov-file#5-create-td-image).

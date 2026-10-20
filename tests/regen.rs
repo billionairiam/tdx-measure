@@ -50,12 +50,12 @@ fn fixtures_to_regen() -> Vec<PathBuf> {
     out
 }
 
-/// Reads `boot_config.qemu.accel` from a fixture's metadata.json, defaulting to
-/// `"kvm"` if the block is absent (the Canonical-fallback path).
+/// Reads `qemu_options.accel` from a fixture's metadata.json, defaulting to
+/// `"kvm"` if the field is absent (the Canonical-fallback path).
 fn fixture_accel(fixture: &Path) -> String {
     let raw = std::fs::read_to_string(fixture.join("metadata.json")).unwrap();
     let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    json["boot_config"]["qemu"]["accel"]
+    json["qemu_options"]["accel"]
         .as_str()
         .unwrap_or("kvm")
         .to_string()
@@ -95,16 +95,16 @@ fn create_acpi_tables_reproduces_each_fixture_byte_for_byte() {
         let distro = if accel == "kvm" { "ubuntu:25.04" } else { "ubuntu:26.04" };
 
         let status = Command::new(&cli)
+            .arg("gen-acpi")
             .arg(fixture.join("metadata.json"))
-            .args(["--platform-only", "--direct-boot", "true"])
-            .args(["--create-acpi-tables", distro])
+            .args(["--distribution", distro])
             .status();
 
         // Always restore the captured copy, even on error.
         if !captured.exists() {
             // Re-stash so the post-comparison can fail meaningfully.
             std::fs::rename(&stash, &captured).expect("restore captured bytes");
-            panic!("{name}: --create-acpi-tables didn't produce acpi_tables.bin (status={status:?})");
+            panic!("{name}: gen-acpi didn't produce acpi_tables.bin (status={status:?})");
         }
         let regenerated = std::fs::read(&captured).expect("read regenerated acpi_tables.bin");
         // Replace the just-generated file with the captured one so subsequent

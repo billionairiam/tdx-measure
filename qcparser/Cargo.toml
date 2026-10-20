@@ -1,0 +1,14 @@
+[package]
+name = "qcparser"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "qcparser"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }

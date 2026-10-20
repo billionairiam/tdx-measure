@@ -11,6 +11,27 @@ use std::process::Command;
 use log::debug;
 use crate::util::utf16_encode;
 
+/// Resolve the guestfish binary path via `which`, returning a clear error if
+/// it is not installed.
+fn guestfish_bin() -> Result<String> {
+    let output = Command::new("which")
+        .arg("guestfish")
+        .output()
+        .context("Failed to run `which guestfish`")?;
+    if !output.status.success() {
+        bail!(
+            "guestfish not found. Please install it (e.g. `sudo apt install libguestfs-tools`) and ensure it is on your PATH."
+        );
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        bail!(
+            "guestfish not found. Please install it (e.g. `sudo apt install libguestfs-tools`) and ensure it is on your PATH."
+        );
+    }
+    Ok(path)
+}
+
 /// Helper function to download a file using guestfish
 fn guestfish_download(qcow2_path: &str, source_path: &str) -> Result<Vec<u8>> {
 
@@ -22,7 +43,7 @@ fn guestfish_download(qcow2_path: &str, source_path: &str) -> Result<Vec<u8>> {
     let dest_path = temp_dir.join("extracted_file");
 
     // Download the file using guestfish
-    let output = Command::new("guestfish")
+    let output = Command::new(guestfish_bin()?)
         .args(&[
             "--ro", "-a", qcow2_path, "-i",
             "download", source_path, dest_path.to_str().unwrap()
@@ -47,7 +68,7 @@ fn guestfish_download(qcow2_path: &str, source_path: &str) -> Result<Vec<u8>> {
 /// Extracts GPT event data in the format used by EV_EFI_GPT_EVENT
 fn extract_gpt_event_data(qcow2_path: &str) -> Result<Vec<u8>> {
     // Extract GPT header from LBA 1 (skip MBR at LBA 0)
-    let output = Command::new("guestfish")
+    let output = Command::new(guestfish_bin()?)
         .args(&[
             "--ro", "-a", qcow2_path,
             "run", ":",
@@ -85,7 +106,7 @@ fn extract_gpt_event_data(qcow2_path: &str) -> Result<Vec<u8>> {
     let entries_offset = partition_entry_lba * 512;
     let entries_length = sectors_needed * 512;
 
-    let output = Command::new("guestfish")
+    let output = Command::new(guestfish_bin()?)
         .args(&[
             "--ro", "-a", qcow2_path,
             "run", ":",
@@ -179,7 +200,7 @@ fn extract_kernel_version_from_cmdline(cmdline: &str) -> Result<String> {
 }
 
 /// Main function to measure RTMR1 from a qcow2 disk image
-pub fn measure_rtmr1_from_qcow2(qcow2_path: &str) -> Result<Vec<u8>> {
+pub fn measure_rtmr1_from_qcow2(qcow2_path: &str, include_separator: bool) -> Result<Vec<u8>> {
 
     // Extract bootloader files
     let gpt_data = extract_gpt_event_data(qcow2_path)?;
@@ -191,28 +212,25 @@ pub fn measure_rtmr1_from_qcow2(qcow2_path: &str) -> Result<Vec<u8>> {
     let shim_hash = authenticode_sha384_hash(&shim_data).context("Failed to compute shim hash")?;
     let grub_hash = authenticode_sha384_hash(&grub_data).context("Failed to compute grub hash")?;
 
-    // Compute RTMR1 log
-    let rtmr1_log = vec![
+    // Compute RTMR1 log. Older TDVF (<202411) moves this separator to RTMR0.
+    let mut rtmr1_log = vec![
         measure_sha384(b"Calling EFI Application from Boot Option"),
-        measure_sha384(&[0x00, 0x00, 0x00, 0x00]), // Separator
-        gpt_hash,
-        shim_hash,
-        grub_hash,
-        measure_sha384(b"Exit Boot Services Invocation"),
-        measure_sha384(b"Exit Boot Services Returned with Success"),
     ];
+    if include_separator {
+        rtmr1_log.push(measure_sha384(&[0x00, 0x00, 0x00, 0x00])); // Separator
+    }
+    rtmr1_log.push(gpt_hash);
+    rtmr1_log.push(shim_hash);
+    rtmr1_log.push(grub_hash);
+    rtmr1_log.push(measure_sha384(b"Exit Boot Services Invocation"));
+    rtmr1_log.push(measure_sha384(b"Exit Boot Services Returned with Success"));
 
     debug_print_log("RTMR1", &rtmr1_log);
     Ok(measure_log(&rtmr1_log))
 }
 
 /// Measures RTMR2 using actual MOK variable data extracted from shim
-pub fn measure_rtmr2_from_qcow2(qcow2_path: &str, cmdline: &str, ref_mok_list: &str, ref_mok_list_trusted: &str, ref_mok_list_x: &str) -> Result<Vec<u8>> {
-
-    // Extract reference MOK variables
-    let ref_mok_list_data = read_file_data(ref_mok_list)?;
-    let ref_mok_list_trusted_data = read_file_data(ref_mok_list_trusted)?;
-    let ref_mok_list_x_data = read_file_data(ref_mok_list_x)?;
+pub fn measure_rtmr2_from_qcow2(qcow2_path: &str, cmdline: &str, ref_mok_list: Option<&str>, ref_mok_list_trusted: Option<&str>, ref_mok_list_x: Option<&str>) -> Result<Vec<u8>> {
 
     // Extract kernel version from command line and construct initrd path
     let kernel_version = extract_kernel_version_from_cmdline(cmdline)?;
@@ -221,14 +239,19 @@ pub fn measure_rtmr2_from_qcow2(qcow2_path: &str, cmdline: &str, ref_mok_list: &
     // Extract initrd
     let initrd_data = guestfish_download(qcow2_path, &initrd_path)?;
 
-    // Compute RTMR2 log
-    let rtmr2_log = vec![
-        measure_sha384(&ref_mok_list_data),
-        measure_sha384(&ref_mok_list_x_data),
-        measure_sha384(&ref_mok_list_trusted_data),
-        measure_sha384(&utf16_encode(cmdline)),
-        measure_sha384(&initrd_data),
-    ];
+    // Compute RTMR2 log. MOK variables are optional; skip any that are absent.
+    let mut rtmr2_log = Vec::new();
+    if let Some(p) = ref_mok_list {
+        rtmr2_log.push(measure_sha384(&read_file_data(p)?));
+    }
+    if let Some(p) = ref_mok_list_x {
+        rtmr2_log.push(measure_sha384(&read_file_data(p)?));
+    }
+    if let Some(p) = ref_mok_list_trusted {
+        rtmr2_log.push(measure_sha384(&read_file_data(p)?));
+    }
+    rtmr2_log.push(measure_sha384(&utf16_encode(cmdline)));
+    rtmr2_log.push(measure_sha384(&initrd_data));
 
     debug_print_log("RTMR2", &rtmr2_log);
     Ok(measure_log(&rtmr2_log))

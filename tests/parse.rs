@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use tdx_measure::{ImageConfig, Machine};
+use tdx_measure::Machine;
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures")
@@ -43,15 +43,45 @@ struct Expected {
     rtmr0: String,
 }
 
-/// Reads metadata.json, resolves the BIOS reference against `ovmf_path()`
-/// instead of the path in the json (so the test doesn't need to bake the
-/// absolute repo path into the checked-in fixture), and builds a Machine the
-/// caller can `measure_platform()` on.
-fn machine_for(fixture: &Path) -> (ImageConfig, PathBuf) {
-    let raw = std::fs::read_to_string(fixture.join("metadata.json"))
-        .expect("read metadata.json");
-    let cfg: ImageConfig = serde_json::from_str(&raw).expect("parse metadata.json");
-    (cfg, fixture.join("metadata.json"))
+/// Loads a Machine from a fixture's metadata.json, overriding the BIOS path
+/// to the shared OVMF.fd so tests are host-independent.
+fn machine_for(fixture: &Path) -> Machine {
+    let metadata_path = fixture.join("metadata.json");
+    let mut machine = Machine::from_metadata_file(&metadata_path)
+        .expect("load metadata.json");
+    // Override BIOS to the shared fixture OVMF.fd
+    if let Some(qo) = &mut machine.qemu_options {
+        qo.bios = ovmf_path().display().to_string();
+    }
+    // Ensure direct boot mode for platform measurement
+    if let Some(mc) = &mut machine.measure_config {
+        mc.bootmode = "direct".into();
+        if mc.kernel.is_none() {
+            mc.kernel = Some("/dev/null".into());
+        }
+        if mc.initrd.is_none() {
+            mc.initrd = Some("/dev/null".into());
+        }
+    } else {
+        machine.measure_config = Some(tdx_measure::MeasureConfig {
+            bootmode: "direct".into(),
+            tdvf_before_202411: false,
+            acpi_tables_bin: Some(String::new()),
+            rsdp: None,
+            table_loader: None,
+            boot_order: None,
+            path_boot_xxxx: None,
+            kernel: Some("/dev/null".into()),
+            initrd: Some("/dev/null".into()),
+            cmdline: None,
+            qcow2: None,
+            mok_list: None,
+            mok_list_trusted: None,
+            mok_list_x: None,
+            sbat_level: None,
+        });
+    }
+    machine
 }
 
 #[test]
@@ -72,37 +102,7 @@ fn measure_platform_matches_expected_json_for_every_fixture() {
         )
         .expect("parse expected.json");
 
-        let (cfg, metadata_path) = machine_for(&fixture);
-        let bc = cfg.boot_config.as_ref().expect("boot_config required");
-
-        // Resolve fixture-relative paths the same way the CLI does, but pin
-        // the BIOS to the shared OVMF.fd so the fixture is host-independent.
-        let parent = metadata_path.parent().unwrap();
-        let acpi = parent.join(&bc.acpi_tables).display().to_string();
-        let bios = ovmf_path().display().to_string();
-
-        let machine = Machine::builder()
-            .cpu_count(bc.cpus)
-            .memory_size(cfg.memory_size().expect("memory_size"))
-            .firmware(bios.as_str())
-            .kernel_cmdline("")
-            .acpi_tables(acpi.as_str())
-            .rsdp("")
-            .table_loader("")
-            .boot_order("")
-            .path_boot_xxxx("")
-            .kernel("/dev/null")
-            .initrd("/dev/null")
-            .qcow2("")
-            .mok_list("")
-            .mok_list_trusted("")
-            .mok_list_x("")
-            .sbat_level("")
-            .direct_boot(true)
-            .metadata_path(&metadata_path)
-            .create_acpi_table(false)
-            .distribution("")
-            .build();
+        let machine = machine_for(&fixture);
 
         let m = machine
             .measure_platform()

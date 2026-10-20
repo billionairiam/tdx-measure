@@ -33,3 +33,6 @@ Thumbs.db
 # Output files
 *.txt
 *.out
+
+/materials
+/measure

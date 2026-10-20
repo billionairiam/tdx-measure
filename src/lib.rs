@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2025 Phala Network
  * Copyright (c) 2025 Tinfoil Inc
- * Copyright (c) 2025 Intel Corporation
+ * Copyright (c) 2025-2026 Intel Corporation
  * SPDX-License-Identifier: Apache-2.0
  */
 use serde::{Deserialize, Serialize};
@@ -37,127 +37,126 @@ pub struct TdxMeasurements {
     pub rtmr2: Vec<u8>,
 }
 
-/// Common boot configuration (platform-specific)
+/// QEMU launch options defining the VM shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BootConfig {
-    pub cpus: u8,
+pub struct QemuOptions {
     pub memory: String,
     pub bios: String,
-    pub acpi_tables: String,
-    pub rsdp: Option<String>,
-    pub table_loader: Option<String>,
-    pub boot_order: Option<String>,
-    pub path_boot_xxxx: Option<String>,
-    pub qemu: Option<QemuShape>,
-}
-
-/// QEMU command-line pass-through consumed by the ACPI dumper.
-/// Device-ordering matters. See README for the field-by-field schema.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QemuShape {
-    pub machine: String,
-    #[serde(default = "default_cpu")]
-    pub cpu: String,
-    #[serde(default = "default_accel")]
-    pub accel: String,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accel: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub globals: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub objects: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub numas: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acpi_tables: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub netdevs: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fw_cfg: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blockdevs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drives: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chardevs: Vec<String>,
 }
 
-fn default_cpu() -> String { "host".to_string() }
-fn default_accel() -> String { "kvm".to_string() }
-
-/// Direct boot specific information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DirectBoot {
-    pub kernel: String,
-    pub initrd: String,
-    pub cmdline: String,
-}
-
-/// Indirect boot specific information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndirectBoot {
-    pub qcow2: String,
-    pub cmdline: String,
-    pub mok_list: String,
-    pub mok_list_trusted: String,
-    pub mok_list_x: String,
-    pub sbat_level: String,
-}
-
-/// Complete image configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImageConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub boot_config: Option<BootConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub direct: Option<DirectBoot>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub indirect: Option<IndirectBoot>,
-}
-
-impl ImageConfig {
-    /// Validate that exactly one boot mode is specified
-    pub fn validate(&self) -> Result<(), String> {
-        match (&self.direct, &self.indirect) {
-            (Some(_), None) => Ok(()),
-            (None, Some(_)) => Ok(()),
-            (Some(_), Some(_)) => Err("Cannot specify both direct and indirect boot".to_string()),
-            (None, None) => Ok(()),
-        }
+impl QemuOptions {
+    /// Whether QEMU shape fields are present (i.e. `machine` is set).
+    pub fn has_qemu_shape(&self) -> bool {
+        self.machine.is_some()
     }
 
-    /// Check if this is direct boot mode
+    /// Get the CPU model (defaults to "host").
+    pub fn cpu_model(&self) -> &str {
+        self.cpu.as_deref().unwrap_or("host")
+    }
+
+    /// Get the accelerator (defaults to "kvm").
+    pub fn accelerator(&self) -> &str {
+        self.accel.as_deref().unwrap_or("kvm")
+    }
+
+    /// The `-smp` value to feed QEMU. Prefers the preserved full topology
+    /// (`smp`) so the ACPI dumper reproduces the guest's MADT/SRAT exactly.
+    /// When `smp` is absent, falls back to QEMU's own default of a single CPU
+    /// rather than guessing a count: callers that know the real topology
+    /// (`gen-metadata`, fixtures) always populate `smp`, so this fallback is
+    /// only ever hit by hand-written metadata that omitted it entirely.
+    pub fn smp_value(&self) -> String {
+        self.smp.clone().unwrap_or_else(|| "1".to_string())
+    }
+}
+
+/// Measurement-specific configuration.
+/// Contains `bootmode` to distinguish direct vs indirect boot,
+/// plus all inputs needed for measurement computation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeasureConfig {
+    pub bootmode: String,
+    /// True if the TDVF firmware predates the 202411 build. In that case the
+    /// RTMR1 separator event is moved to the end of the RTMR0 measurement log.
+    /// Defaults to true (older firmware).
+    #[serde(default = "default_true")]
+    pub tdvf_before_202411: bool,
+    /// Path to the generated ACPI tables binary (measurement input).
+    #[serde(skip_serializing_if = "is_none_or_empty")]
+    pub acpi_tables_bin: Option<String>,
+    #[serde(skip_serializing_if = "is_none_or_empty")]
+    pub rsdp: Option<String>,
+    #[serde(skip_serializing_if = "is_none_or_empty")]
+    pub table_loader: Option<String>,
+    #[serde(skip_serializing_if = "is_none_or_empty")]
+    pub boot_order: Option<String>,
+    #[serde(skip_serializing_if = "is_none_or_empty")]
+    pub path_boot_xxxx: Option<String>,
+    // Direct boot fields
+    #[serde(skip_serializing_if = "is_none_or_empty")]
+    pub kernel: Option<String>,
+    #[serde(skip_serializing_if = "is_none_or_empty")]
+    pub initrd: Option<String>,
+    #[serde(skip_serializing_if = "is_none_or_empty")]
+    pub cmdline: Option<String>,
+    // Indirect boot fields
+    #[serde(skip_serializing_if = "is_none_or_empty")]
+    pub qcow2: Option<String>,
+    #[serde(skip_serializing_if = "is_none_or_empty")]
+    pub mok_list: Option<String>,
+    #[serde(skip_serializing_if = "is_none_or_empty")]
+    pub mok_list_trusted: Option<String>,
+    #[serde(skip_serializing_if = "is_none_or_empty")]
+    pub mok_list_x: Option<String>,
+    #[serde(skip_serializing_if = "is_none_or_empty")]
+    pub sbat_level: Option<String>,
+}
+
+impl MeasureConfig {
     pub fn is_direct_boot(&self) -> bool {
-        self.direct.is_some()
-    }
-
-    /// Get direct boot info
-    pub fn direct_boot(&self) -> Option<&DirectBoot> {
-        self.direct.as_ref()
-    }
-
-    /// Get indirect boot info
-    pub fn indirect_boot(&self) -> Option<&IndirectBoot> {
-        self.indirect.as_ref()
-    }
-
-    /// Get command line regardless of boot mode
-    pub fn cmdline(&self) -> &str {
-        match (&self.direct, &self.indirect) {
-            (Some(direct), None) => &direct.cmdline,
-            (None, Some(indirect)) => &indirect.cmdline,
-            _ => "", // Should not happen after validation
-        }
-    }
-
-    /// Get CPU count from boot config
-    pub fn cpu_count(&self) -> Result<u8> {
-        let boot_config = self.boot_config.as_ref()
-            .ok_or_else(|| anyhow!("Boot config is required"))?;
-
-        Ok(boot_config.cpus)
-    }
-
-    /// Get memory size from boot config
-    pub fn memory_size(&self) -> Result<u64> {
-        let boot_config = self.boot_config.as_ref()
-            .ok_or_else(|| anyhow!("Boot config is required"))?;
-
-        parse_memory_size(&boot_config.memory)
+        self.bootmode == "direct"
     }
 }
 
-/// Parse a memory size value that can be decimal or hexadecimal (with 0x prefix)
+fn default_true() -> bool {
+    true
+}
+
+fn is_none_or_empty(s: &Option<String>) -> bool {
+    s.as_ref().map_or(true, |v| v.trim().is_empty())
+}
+
+/// Parse a memory size value that can be decimal or hexadecimal (with 0x prefix),
+/// with optional K/M/G/T suffix.
 pub fn parse_memory_size(s: &str) -> Result<u64> {
     let s = s.trim();
 

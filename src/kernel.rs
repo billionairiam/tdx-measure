@@ -98,6 +98,7 @@ pub(crate) fn measure_rtmr1_direct(
     initrd_path: &str,
     mem_size: u64,
     acpi_data_size: u32,
+    include_separator: bool,
 ) -> Result<Vec<u8>> {
 
     // Read kernel and initrd files
@@ -110,14 +111,16 @@ pub(crate) fn measure_rtmr1_direct(
         .context("Failed to patch kernel")?;
     let kernel_hash = authenticode_sha384_hash(&kd).context("Failed to compute kernel hash")?;
 
-    // Compute RTMR1 log
-    let rtmr1_log = vec![
+    // Compute RTMR1 log. Older TDVF (<202411) moves this separator to RTMR0.
+    let mut rtmr1_log = vec![
         kernel_hash,
         measure_sha384(b"Calling EFI Application from Boot Option"),
-        measure_sha384(&[0x00, 0x00, 0x00, 0x00]), // Separator
-        measure_sha384(b"Exit Boot Services Invocation"),
-        measure_sha384(b"Exit Boot Services Returned with Success"),
     ];
+    if include_separator {
+        rtmr1_log.push(measure_sha384(&[0x00, 0x00, 0x00, 0x00])); // Separator
+    }
+    rtmr1_log.push(measure_sha384(b"Exit Boot Services Invocation"));
+    rtmr1_log.push(measure_sha384(b"Exit Boot Services Returned with Success"));
 
     debug_print_log("RTMR1", &rtmr1_log);
     Ok(measure_log(&rtmr1_log))

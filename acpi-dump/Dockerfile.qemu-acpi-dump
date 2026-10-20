@@ -9,7 +9,9 @@ FROM ${DISTRIBUTION}
 #   "main" -> pull-lp-source from the distribution's main archive
 ARG QEMU_SOURCE=ppa
 ARG QEMU_VERSION=
-ARG ACPI_TABLES_NAME
+ARG ACPI_TABLES
+ARG ACPI_LOADER
+ARG ACPI_RSDP
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -19,6 +21,10 @@ RUN apt-get update && \
         git \
         ubuntu-dev-tools \
         libglib2.0-dev \
+        libslirp-dev \
+        libnuma-dev \
+        seabios \
+        ipxe-qemu \
         meson \
         ninja-build \
         python3-venv && \
@@ -45,16 +51,49 @@ WORKDIR /qemu-source
 USER qemu-user
 
 # Patch QEMU source to dump ACPI tables: inject code to write ACPI tables to /output/, force EOI intercept to 1, and skip pc-bios/tests builds
-ARG acpi_tables_dump_loc='\n\n    int fd = open("\/output\/'"${ACPI_TABLES_NAME}"'", O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);\n    if(fd != -1) {\n        int ret = write(fd, (uint8_t *)tables.table_data->data, tables.table_data->len);\n        if (ret < tables.table_data->len) {\n            printf("Error: Failed to write the acpi tables\\n");\n        } else {\n            printf("Successfully wrote the acpi tables to the file \\"'"${ACPI_TABLES_NAME}"'\\"\\n");\n        }\n    } else {\n        printf("Error: Failed to create acpi_tables file.\\n");\n    }\n    exit(0);'
 ARG acpi_build_c="hw/i386/acpi-build.c"
 ARG acpi_common_c="hw/i386/acpi-common.c"
 ARG meson_build="meson.build"
 
-# The subdir('tests') reference moved inside an `if want_tools` block in QEMU 10.x and is now indented;
-# match optional leading whitespace so both layouts get commented out alongside subdir('pc-bios').
-RUN perl -i -0pe 's/(acpi_build_update\(void \*build_opaque\)[\s\S]*?acpi_build\([^;]*;)/\1'"$acpi_tables_dump_loc"'/gs' "$acpi_build_c" && \
+RUN cat > /tmp/acpi-dump-inject.c <<EOF
+    struct {
+        const char *path;
+        GArray *blob;
+    } dump_files[] = {
+        { "/output/${ACPI_TABLES}",   tables.table_data },
+        { "/output/${ACPI_LOADER}",  tables.linker->cmd_blob },
+        { "/output/${ACPI_RSDP}",     tables.rsdp },
+    };
+
+    for (int i = 0; i < sizeof(dump_files) / sizeof(dump_files[0]); i++) {
+        int fd = open(dump_files[i].path,
+                      O_CREAT | O_TRUNC | O_WRONLY,
+                      S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+
+        if (fd == -1) {
+            printf("Error: Failed to create %s\n", dump_files[i].path);
+            exit(1);
+        }
+
+        ssize_t ret = write(fd, dump_files[i].blob->data, dump_files[i].blob->len);
+        close(fd);
+
+        if (ret != (ssize_t)dump_files[i].blob->len) {
+            printf("Error: Failed to write %s\n", dump_files[i].path);
+            exit(1);
+        }
+
+        printf("Successfully wrote %s\n", dump_files[i].path);
+    }
+
+    exit(0);
+EOF
+
+# # The subdir('tests') reference moved inside an `if want_tools` block in QEMU 10.x and is now indented;
+# # match optional leading whitespace so both layouts get commented out.
+RUN perl -i -0pe 'BEGIN { local $/; open my $fh, "<", "/tmp/acpi-dump-inject.c" or die $!; $inject = <$fh>; } s{(acpi_build_update\(void \*build_opaque\)[\s\S]*?acpi_build\([^;]*;)}{$1 . $inject}egs' "$acpi_build_c" && \
     perl -i -pe 's/x86ms->eoi_intercept_unsupported;/1;/g' "$acpi_build_c" "$acpi_common_c" && \
-    perl -i -pe "s/^(\s*)(subdir\('pc-bios'\)|subdir\('tests'\))/\$1# \$2/g" "$meson_build"
+    perl -i -pe "s/^(\s*)(subdir\('pc-bios'\)|subdir\('tests'\))/\1# \2/g" "$meson_build"
 
 # Configure QEMU with minimal features to reduce build time and image size - only KVM acceleration is needed for ACPI table generation
 RUN ./configure \
@@ -81,10 +120,11 @@ RUN ./configure \
     --disable-libiscsi \
     --disable-vnc-jpeg \
     --enable-kvm \
+    --enable-slirp \
     --disable-lzo \
     --disable-curses \
     --disable-libnfs \
-    --disable-numa \
+    --enable-numa \
     --disable-opengl \
     --disable-rbd \
     --disable-vnc-sasl \

@@ -1,11 +1,13 @@
 {
-    "boot_config": {
-        "cpus": 4,
+    "qemu_options": {
+        "smp": "4",
         "memory": "2048M",
-        "bios": "../OVMF.fd",
-        "acpi_tables": "acpi_tables.bin"
+        "bios": "../OVMF.fd"
     },
-    "direct": {
+    "measure_config": {
+        "bootmode": "direct",
+        "tdvf_before_202411": false,
+        "acpi_tables_bin": "acpi_tables.bin",
         "kernel": "/dev/null",
         "initrd": "/dev/null",
         "cmdline": ""

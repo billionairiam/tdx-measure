@@ -1,0 +1,13 @@
+[package]
+name = "acpi-dump"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Standalone patched-QEMU ACPI-tables dumper for tdx-measure"
+
+[dependencies]
+tdx-measure = { path = ".." }
+anyhow = { workspace = true }
+fs-err = { workspace = true }
+log = "0.4"
+tempfile = "3.27.0"

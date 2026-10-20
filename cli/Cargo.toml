@@ -1,5 +1,5 @@
 [package]
-name = "tdx-measure-cli"
+name = "cli"
 version = "0.1.0"
 edition = "2021"
 
@@ -8,10 +8,12 @@ name = "tdx-measure"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
+clap = { workspace = true }
 tdx-measure = { path = ".." }
-anyhow = "1.0"
-hex = "0.4"
-fs-err = "3.2"
-serde_json = "1.0"
-tracing-subscriber = "0.3"
+acpi-dump = { path = "../acpi-dump" }
+qcparser = { path = "../qcparser" }
+anyhow = { workspace = true }
+hex = { workspace = true }
+fs-err = { workspace = true }
+serde_json = { workspace = true }
+tracing-subscriber = { workspace = true }

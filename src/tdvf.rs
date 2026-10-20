@@ -88,33 +88,41 @@ fn measure_tdx_efi_variable(vendor_guid: &str, var_name: &str, var_data: Option<
 /// For direct boot, returns a simulated boot order with no boot entries.
 /// For indirect boot, reads the boot order file and extracts the list of boot entry numbers.
 fn parse_boot_order(machine: &Machine) -> Result<(Vec<u8>, Vec<u16>)> {
-    if machine.direct_boot {
+    if machine.is_direct_boot() {
         // Direct boot: simulated boot order data
         Ok((vec![0, 0], Vec::new()))
-    } else if !machine.boot_order.is_empty() {
-        // Indirect boot: read and parse the boot order file
-        let boot_order_data = read_file_data(machine.boot_order)?;
-
-        // Validate and parse boot order data
-        if boot_order_data.len() % 2 != 0 {
-            bail!("BootOrder data length must be even (array of UINT16s)");
-        }
-
-        let mut boot_entries = Vec::new();
-        for chunk in boot_order_data.chunks(2) {
-            let entry_num = u16::from_le_bytes([chunk[0], chunk[1]]);
-            boot_entries.push(entry_num);
-        }
-
-        Ok((boot_order_data, boot_entries))
     } else {
-        Err(anyhow!("Boot order file is required for indirect boot"))
+        let boot_order_path = machine.measure_config.as_ref()
+            .and_then(|mc| mc.boot_order.as_deref())
+            .unwrap_or("");
+        if !boot_order_path.is_empty() {
+            // Indirect boot: read and parse the boot order file
+            let boot_order_data = read_file_data(boot_order_path)?;
+
+            // Validate and parse boot order data
+            if boot_order_data.len() % 2 != 0 {
+                bail!("BootOrder data length must be even (array of UINT16s)");
+            }
+
+            let mut boot_entries = Vec::new();
+            for chunk in boot_order_data.chunks(2) {
+                let entry_num = u16::from_le_bytes([chunk[0], chunk[1]]);
+                boot_entries.push(entry_num);
+            }
+
+            Ok((boot_order_data, boot_entries))
+        } else {
+            Err(anyhow!("Boot order file is required for indirect boot"))
+        }
     }
 }
 
 /// Loads boot variable data if the corresponding file exists
 fn load_boot_variable_if_exists(boot_entry_num: u16, machine: &Machine) -> Result<Option<Vec<u8>>> {
-    let filename = format!("{}/Boot{:04X}.bin", machine.path_boot_xxxx, boot_entry_num);
+    let path_boot_xxxx = machine.measure_config.as_ref()
+        .and_then(|mc| mc.path_boot_xxxx.as_deref())
+        .unwrap_or("");
+    let filename = format!("{}/Boot{:04X}.bin", path_boot_xxxx, boot_entry_num);
     // Try to read the file, return None if it doesn't exist
     match read_file_data(&filename) {
         Ok(data) => Ok(Some(data)),
@@ -262,7 +270,8 @@ impl<'a> Tdvf<'a> {
 
     pub fn rtmr0(&self, machine: &Machine) -> Result<Vec<u8>> {
         // Calculate measurement of the TD Hand-Off Block (TD-HOB)
-        let td_hob_hash = self.measure_td_hob(machine.memory_size)?;
+        let memory_size = machine.memory_size()?;
+        let td_hob_hash = self.measure_td_hob(memory_size)?;
 
         // Calculate measurement of the Configuration Firmware Volume (CFV)
         let cfv_hash = self.measure_cfv().context("Failed to find CFV section")?;
@@ -292,7 +301,7 @@ impl<'a> Tdvf<'a> {
             measure_sha384(&boot_order_data), // Always measure BootOrder itself
         ];
 
-        if machine.direct_boot {
+        if machine.is_direct_boot() {
             // Boot0000 data for direct boot mode
             let boot0000_hex = "090100002c0055006900410070007000000004071400c9bdb87cebf8344faaea3ee4af6516a10406140021aa2c4614760345836e8ab6f46623317fff0400";
             let boot0000 = hex::decode(boot0000_hex).context("Failed to decode boot0000 hex string")?;
@@ -305,8 +314,16 @@ impl<'a> Tdvf<'a> {
             }
         }
 
+        // TDVF firmware before the 202411 build appends a trailing separator.
+        let before_202411 = machine.measure_config.as_ref()
+            .map(|mc| mc.tdvf_before_202411)
+            .unwrap_or(false);
+        if before_202411 {
+            rtmr0_log.push(measure_sha384(&[0x00, 0x00, 0x00, 0x00])); // Separator
+        }
+
         // Add SbatLevel if not direct boot
-        if !machine.direct_boot {
+        if !machine.is_direct_boot() {
             rtmr0_log.push(measure_tdx_efi_variable("605DAB50-E046-4300-ABB6-3DD810DD8B23", "SbatLevel", Some(b"sbat,1,2021030218\n"))?);
         }
 

@@ -1,29 +1,28 @@
 {
-    "boot_config": {
-        "cpus": 8,
+    "qemu_options": {
+        "smp": "8,maxcpus=8",
         "memory": "4096M",
         "bios": "../OVMF.fd",
-        "acpi_tables": "acpi_tables.bin",
-        "qemu": {
-            "machine": "q35,kernel_irqchip=split,memory-backend=mem0,smm=off,pic=off",
-            "cpu": "Skylake-Server,phys-bits=46",
-            "accel": "tcg",
-            "globals": [
-                "q35-pcihost.pci-hole64-size=4096G"
-            ],
-            "objects": [
-                "memory-backend-ram,id=mem0,size=4096M"
-            ],
-            "netdevs": [],
-            "devices": [
-                "virtio-rng-pci",
-                "virtio-balloon-pci",
-                "virtio-scsi-pci,id=scsi0"
-            ],
-            "fw_cfg": []
-        }
+        "machine": "q35,kernel_irqchip=split,memory-backend=mem0,smm=off,pic=off",
+        "cpu": "Skylake-Server,phys-bits=46",
+        "accel": "tcg",
+        "globals": [
+            "q35-pcihost.pci-hole64-size=4096G"
+        ],
+        "objects": [
+            "memory-backend-ram,id=mem0,size=4096M"
+        ],
+        "devices": [
+            "virtio-rng-pci",
+            "virtio-balloon-pci",
+            "virtio-scsi-pci,id=scsi0"
+        ],
+        "fw_cfg": []
     },
-    "direct": {
+    "measure_config": {
+        "bootmode": "direct",
+        "tdvf_before_202411": false,
+        "acpi_tables_bin": "acpi_tables.bin",
         "kernel": "/dev/null",
         "initrd": "/dev/null",
         "cmdline": ""
