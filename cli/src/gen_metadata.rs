@@ -79,7 +79,7 @@ fn machine_from_grouped(g: &Grouped, boot_mode: &str, tdvf_before_202411: bool) 
         tdvf_before_202411,
         secure_boot: None,
         shim_fallback: None,
-        boot_current: None,
+        boot_current: opt(indirect, "[Path to BootCurrent.bin]"),
         acpi_tables_bin: Some("[Path to acpi_tables_bin]".to_string()),
         rsdp: opt(indirect, "[Path to rsdp]"),
         table_loader: opt(indirect, "[Path to table_loader]"),
@@ -208,7 +208,8 @@ fn fill_from_guest(mc: &mut MeasureConfig, opts: &GuestOptions, src: &GuestSourc
     file(&mut mc.rsdp, "rsdp.bin", false);
     file(&mut mc.table_loader, "table_loader.bin", false);
     file(&mut mc.boot_order, "BootOrder.bin", false);
-    file(&mut mc.boot_current, "BootCurrent.bin", true);
+    // Required to tell whether this boot went through shim's fallback path.
+    file(&mut mc.boot_current, "BootCurrent.bin", false);
     file(&mut mc.mok_list, "MokListRT.bin", true);
     file(&mut mc.mok_list_trusted, "MokListTrustedRT.bin", true);
     file(&mut mc.mok_list_x, "MokListXRT.bin", true);
@@ -314,6 +315,11 @@ mod tests {
         assert_eq!(mc.cmdline.as_deref(), Some("BOOT_IMAGE=/vmlinuz ro"));
         assert_eq!(mc.disk.as_deref(), Some("/dev/vda"));
         assert_eq!(mc.qcow2, None);
+
+        fs::remove_file(work.join("BootCurrent.bin")).unwrap();
+        run_with(&root.join("command"), "indirect", true, &meta, Some(&opts), &sources).unwrap();
+        let machine: Machine = serde_json::from_str(&fs::read_to_string(&meta).unwrap()).unwrap();
+        assert_eq!(machine.measure_config.unwrap().boot_current.as_deref(), Some("[Path to BootCurrent.bin]"));
 
         let err = run_with(&root.join("command"), "direct", true, &meta, Some(&opts), &sources).unwrap_err();
         assert!(err.to_string().contains("indirect"));

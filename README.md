@@ -179,6 +179,7 @@ Create `metadata.json` file with the below metadata:
     "rsdp": "[path to rsdp.bin]",
     "table_loader": "[path to table_loader.bin]",
     "boot_order": "[path to BootOrder.bin]",
+    "boot_current": "[path to BootCurrent.bin]",
     "path_boot_xxxx": "[path to directory containing Bootxxxx.bin files]",
     "qcow2": "[path to tdx-guest-ubuntu-25.04-generic.qcow2]",
     "cmdline": "console=ttyS0 root=/dev/vda1",
@@ -211,7 +212,7 @@ Create `metadata.json` file with the below metadata:
   - `path_boot_xxxx`: Path to directory containing files (e.g., `Boot0000.bin`, `Boot0001.bin`, `Boot0002.bin`) for each Boot#### UEFI variables.
     Each variable defines a specific boot option with its device path and description.
     These files can be extracted by running the [`extract_config_files.py`](extract_config_files.py) script inside a TD, which is configured identically to the target configuration.
-  - `boot_current` *(optional, in-guest)*: Path to file containing the UEFI BootCurrent variable, captured by [`extract_config_files.py`](extract_config_files.py). Used to detect a shim fallback boot (see `shim_fallback`).
+  - `boot_current` *(optional)*: Path to file containing the UEFI BootCurrent variable, captured by [`extract_config_files.py`](extract_config_files.py) in the TD whose boot is being measured. Used to detect a shim fallback boot (see `shim_fallback`). `gen-metadata` emits it for indirect boot; remove it to predict the boot from the `qcow2` image instead.
   - `shim_fallback` *(optional)*: override for whether firmware boots via shim's fallback path, `\EFI\BOOT\BOOTX64.EFI` → `fbx64.efi` → `\EFI\ubuntu\shimx64.efi`. OVMF does this when no OS boot entry exists, i.e. when the ESP has no `/NvVars` (e.g. the first boot of a fresh image). Such a boot additionally measures BOOTX64.EFI and fbx64.efi into RTMR[1], measures the MOK variables twice in RTMR[2] and SbatLevel twice in RTMR[0], and the boot entries created by fbx64.efi are not part of the measured BootOrder. Normally omit it: in-guest it is detected from `boot_current` (the booted entry has no file path), and with `qcow2` it is predicted from whether `/boot/efi/NvVars` exists in the image.
 
 - `measure_config` *(indirect fields)*: used to compute RTMR[1] and RTMR[2]
