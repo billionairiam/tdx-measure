@@ -130,7 +130,7 @@ fn run_measure(args: &MeasureArgs) -> Result<()> {
     output_measurements(args, &measurements)?;
 
     if let Some(ref ccel) = args.compare_eventlog {
-        eventlog_compare::compare_eventlog(&machine, ccel)?;
+        eventlog_compare::compare_eventlog(&machine, &measurements, ccel)?;
     }
 
     Ok(())

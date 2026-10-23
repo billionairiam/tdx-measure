@@ -157,6 +157,7 @@ dependencies = [
  "clap",
  "fs-err",
  "hex",
+ "libc",
  "qcparser",
  "serde_json",
  "sha2",

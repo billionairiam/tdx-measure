@@ -39,6 +39,9 @@ events computed by `tdx-measure`, marking each as matching (`=`), only in the lo
 (`-`) or only computed (`+`). For a mismatching GPT event it dumps the GPT from the
 log next to the GPT read from the disk; for a mismatching initrd it reports whether
 the initrd file was modified after boot and which `initrd*` file (if any) matches.
+Inside a TD (`/dev/tdx_guest` present) it also reads the TDREPORT and compares the
+computed MRTD and RTMR0–2 with the running TD's registers; for the TD's own event log
+it also flags RTMRs whose log replay differs from the register.
 A log file path must be given with `=` (e.g. `--compare-eventlog=CCEL.bin`).
 Running with `RUST_LOG=debug` additionally dumps the raw GPT event data computed
 from the disk.
