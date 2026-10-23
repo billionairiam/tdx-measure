@@ -5,9 +5,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use anyhow::{anyhow, bail, Context, Result};
+use log::{debug, warn};
 use sha2::{Digest, Sha384};
 
 use crate::num::read_le;
+use crate::secure_boot::SecureBootVars;
 use crate::util::{debug_print_log, measure_sha384, measure_log, utf16_encode, read_file_data};
 use crate::Machine;
 
@@ -87,7 +89,7 @@ fn measure_tdx_efi_variable(vendor_guid: &str, var_name: &str, var_data: Option<
 /// Loads boot order data and parses boot entry numbers based on boot mode.
 /// For direct boot, returns a simulated boot order with no boot entries.
 /// For indirect boot, reads the boot order file and extracts the list of boot entry numbers.
-fn parse_boot_order(machine: &Machine) -> Result<(Vec<u8>, Vec<u16>)> {
+fn parse_boot_order(machine: &Machine, shim_fallback: bool) -> Result<(Vec<u8>, Vec<u16>)> {
     if machine.is_direct_boot() {
         // Direct boot: simulated boot order data
         Ok((vec![0, 0], Vec::new()))
@@ -110,6 +112,23 @@ fn parse_boot_order(machine: &Machine) -> Result<(Vec<u8>, Vec<u16>)> {
                 boot_entries.push(entry_num);
             }
 
+            // On a fallback boot, firmware measured BootOrder before fbx64.efi
+            // added the OS entries that the runtime capture now contains.
+            // Firmware-generated entries never carry a file path node.
+            if shim_fallback {
+                let mut kept = Vec::new();
+                for num in boot_entries {
+                    match load_boot_variable_if_exists(num, machine)? {
+                        Some(data) if load_option_has_file_path(&data) => {
+                            debug!("Dropping Boot{num:04X} from BootOrder (created by shim fallback)");
+                        }
+                        _ => kept.push(num),
+                    }
+                }
+                let boot_order_data = kept.iter().flat_map(|n| n.to_le_bytes()).collect();
+                return Ok((boot_order_data, kept));
+            }
+
             Ok((boot_order_data, boot_entries))
         } else {
             Err(anyhow!("Boot order file is required for indirect boot"))
@@ -117,8 +136,38 @@ fn parse_boot_order(machine: &Machine) -> Result<(Vec<u8>, Vec<u16>)> {
     }
 }
 
+/// Whether an EFI_LOAD_OPTION's device path contains a MEDIA_FILEPATH_DP node.
+pub(crate) fn load_option_has_file_path(data: &[u8]) -> bool {
+    if data.len() < 6 {
+        return false;
+    }
+    let path_len = u16::from_le_bytes([data[4], data[5]]) as usize;
+    // Skip the NUL-terminated UTF-16 description.
+    let mut off = 6;
+    while off + 1 < data.len() && (data[off] != 0 || data[off + 1] != 0) {
+        off += 2;
+    }
+    off += 2;
+    let end = (off + path_len).min(data.len());
+    while off + 4 <= end {
+        let (ty, sub) = (data[off], data[off + 1]);
+        let len = u16::from_le_bytes([data[off + 2], data[off + 3]]) as usize;
+        if ty == 0x7f && sub == 0xff {
+            break;
+        }
+        if ty == 0x04 && sub == 0x04 {
+            return true;
+        }
+        if len < 4 {
+            break;
+        }
+        off += len;
+    }
+    false
+}
+
 /// Loads boot variable data if the corresponding file exists
-fn load_boot_variable_if_exists(boot_entry_num: u16, machine: &Machine) -> Result<Option<Vec<u8>>> {
+pub(crate) fn load_boot_variable_if_exists(boot_entry_num: u16, machine: &Machine) -> Result<Option<Vec<u8>>> {
     let path_boot_xxxx = machine.measure_config.as_ref()
         .and_then(|mc| mc.path_boot_xxxx.as_deref())
         .unwrap_or("");
@@ -268,7 +317,12 @@ impl<'a> Tdvf<'a> {
         Ok(h.finalize().to_vec())
     }
 
-    pub fn rtmr0(&self, machine: &Machine) -> Result<Vec<u8>> {
+    pub fn rtmr0(&self, machine: &Machine, shim_fallback: bool) -> Result<Vec<u8>> {
+        Ok(measure_log(&self.rtmr0_log(machine, shim_fallback)?))
+    }
+
+    /// RTMR0 event digests in measurement order.
+    pub fn rtmr0_log(&self, machine: &Machine, shim_fallback: bool) -> Result<Vec<Vec<u8>>> {
         // Calculate measurement of the TD Hand-Off Block (TD-HOB)
         let memory_size = machine.memory_size()?;
         let td_hob_hash = self.measure_td_hob(memory_size)?;
@@ -283,23 +337,40 @@ impl<'a> Tdvf<'a> {
         let acpi_loader_hash = measure_sha384(&tables.loader);
 
         // Load boot order data and entries
-        let (boot_order_data, boot_entries) = parse_boot_order(machine)?;
+        let (boot_order_data, boot_entries) = parse_boot_order(machine, shim_fallback)?;
+
+        // Secure Boot variables as initialized from the firmware's CFV variable store.
+        let mut sb = SecureBootVars::from_firmware(self.fw, self.cfv()?);
+        if let Some(enabled) = machine.measure_config.as_ref().and_then(|mc| mc.secure_boot) {
+            sb.secure_boot = Some(enabled as u8);
+        }
+        debug!("Secure Boot variables: SecureBoot={:?} PK={} KEK={} db={} dbx={} dbt={}",
+            sb.secure_boot, sb.pk.is_some(), sb.kek.is_some(), sb.db.is_some(), sb.dbx.is_some(), sb.dbt.is_some());
+        if sb.secure_boot == Some(1) {
+            warn!("Secure Boot is enabled; image verification (EV_EFI_VARIABLE_AUTHORITY) events are not modeled");
+        }
 
         // Compute RTMR0 log
         let mut rtmr0_log = vec![
             td_hob_hash,
             cfv_hash,
-            measure_tdx_efi_variable("8BE4DF61-93CA-11D2-AA0D-00E098032B8C", "SecureBoot", None)?,
-            measure_tdx_efi_variable("8BE4DF61-93CA-11D2-AA0D-00E098032B8C", "PK", None)?,
-            measure_tdx_efi_variable("8BE4DF61-93CA-11D2-AA0D-00E098032B8C", "KEK", None)?,
-            measure_tdx_efi_variable("D719B2CB-3D3A-4596-A3BC-DAD00E67656F", "db", None)?,
-            measure_tdx_efi_variable("D719B2CB-3D3A-4596-A3BC-DAD00E67656F", "dbx", None)?,
+            measure_tdx_efi_variable("8BE4DF61-93CA-11D2-AA0D-00E098032B8C", "SecureBoot", sb.secure_boot.as_ref().map(std::slice::from_ref))?,
+            measure_tdx_efi_variable("8BE4DF61-93CA-11D2-AA0D-00E098032B8C", "PK", sb.pk.as_deref())?,
+            measure_tdx_efi_variable("8BE4DF61-93CA-11D2-AA0D-00E098032B8C", "KEK", sb.kek.as_deref())?,
+            measure_tdx_efi_variable("D719B2CB-3D3A-4596-A3BC-DAD00E67656F", "db", sb.db.as_deref())?,
+            measure_tdx_efi_variable("D719B2CB-3D3A-4596-A3BC-DAD00E67656F", "dbx", sb.dbx.as_deref())?,
+        ];
+        // dbt is only measured when present.
+        if let Some(dbt) = sb.dbt.as_deref() {
+            rtmr0_log.push(measure_tdx_efi_variable("D719B2CB-3D3A-4596-A3BC-DAD00E67656F", "dbt", Some(dbt))?);
+        }
+        rtmr0_log.extend([
             measure_sha384(&[0x00, 0x00, 0x00, 0x00]), // Separator
             acpi_loader_hash,
             acpi_rsdp_hash,
             acpi_tables_hash,
             measure_sha384(&boot_order_data), // Always measure BootOrder itself
-        ];
+        ]);
 
         if machine.is_direct_boot() {
             // Boot0000 data for direct boot mode
@@ -322,13 +393,17 @@ impl<'a> Tdvf<'a> {
             rtmr0_log.push(measure_sha384(&[0x00, 0x00, 0x00, 0x00])); // Separator
         }
 
-        // Add SbatLevel if not direct boot
+        // Add SbatLevel if not direct boot; shim measures it on every run, and
+        // with fallback shim runs twice (BOOTX64.EFI, then shimx64.efi).
         if !machine.is_direct_boot() {
-            rtmr0_log.push(measure_tdx_efi_variable("605DAB50-E046-4300-ABB6-3DD810DD8B23", "SbatLevel", Some(b"sbat,1,2021030218\n"))?);
+            let shim_runs = if shim_fallback { 2 } else { 1 };
+            for _ in 0..shim_runs {
+                rtmr0_log.push(measure_tdx_efi_variable("605DAB50-E046-4300-ABB6-3DD810DD8B23", "SbatLevel", Some(b"sbat,1,2021030218\n"))?);
+            }
         }
 
         debug_print_log("RTMR0", &rtmr0_log);
-        Ok(measure_log(&rtmr0_log))
+        Ok(rtmr0_log)
     }
 
     fn measure_td_hob(&self, memory_size: u64) -> Result<Vec<u8>> {
@@ -392,6 +467,11 @@ impl<'a> Tdvf<'a> {
     }
 
     fn measure_cfv(&self) -> Result<Vec<u8>> {
+        Ok(measure_sha384(self.cfv()?))
+    }
+
+    /// Raw bytes of the CFV section (the pristine UEFI variable store).
+    fn cfv(&self) -> Result<&'a [u8]> {
         for section in &self.sections {
             if section.sec_type == TDVF_SECTION_TD_CFV {
                 let start = section.data_offset as usize;
@@ -401,7 +481,7 @@ impl<'a> Tdvf<'a> {
                     return Err(anyhow!("CFV section extends beyond firmware data."));
                 }
 
-                return Ok(measure_sha384(&self.fw[start..end]));
+                return Ok(&self.fw[start..end]);
             }
         }
 
@@ -442,5 +522,72 @@ impl MemoryAcceptor {
         new_ranges.push((true, start, end));
         new_ranges.sort_by_key(|&(_, start, _)| start);
         self.ranges = new_ranges;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secure_boot_disabled_is_measured_as_one_byte() {
+        // EV_EFI_VARIABLE_DRIVER_CONFIG for SecureBoot from a TD event log
+        // (OVMF built with Secure Boot support, Secure Boot disabled).
+        let digest = measure_tdx_efi_variable("8BE4DF61-93CA-11D2-AA0D-00E098032B8C", "SecureBoot", Some(&[0])).unwrap();
+        assert_eq!(
+            hex::encode(digest),
+            "cfa4e2c606f572627bf06d5669cc2ab1128358d27b45bc63ee9ea56ec109cfafb7194006f847a6a74b5eaed6b73332ec"
+        );
+    }
+
+    // Firmware-generated "UEFI Misc Device" entry (from a real TD event log).
+    const MISC_DEVICE: &str = "010000002200550045004600490020004d006900730063002000440065007600690063006500000002010c00d041030a000000000101060000020101060000000101060000017fff04004eac0881119f594d850ee21a522c59b2";
+
+    /// Entry created by shim fallback: HD(...)/\EFI\ubuntu\shimx64.efi
+    fn ubuntu_boot_option() -> Vec<u8> {
+        let file: Vec<u8> = utf16_encode("\\EFI\\ubuntu\\shimx64.efi").into_iter().chain([0, 0]).collect();
+        let mut path = vec![0x04, 0x01, 42, 0];
+        path.extend([0u8; 38]);
+        path.extend([0x04, 0x04]);
+        path.extend(((file.len() + 4) as u16).to_le_bytes());
+        path.extend(&file);
+        path.extend([0x7f, 0xff, 0x04, 0x00]);
+        let mut option = vec![1, 0, 0, 0];
+        option.extend((path.len() as u16).to_le_bytes());
+        option.extend(utf16_encode("Ubuntu"));
+        option.extend([0, 0]);
+        option.extend(&path);
+        option
+    }
+
+    #[test]
+    fn load_option_file_path_detection() {
+        let ui_app = hex::decode("090100002c0055006900410070007000000004071400c9bdb87cebf8344faaea3ee4af6516a10406140021aa2c4614760345836e8ab6f46623317fff0400").unwrap();
+        assert!(!load_option_has_file_path(&hex::decode(MISC_DEVICE).unwrap()));
+        assert!(!load_option_has_file_path(&ui_app));
+        assert!(load_option_has_file_path(&ubuntu_boot_option()));
+    }
+
+    #[test]
+    fn shim_fallback_detected_from_boot_current() {
+        let dir = std::env::temp_dir().join(format!("tdx_measure_boot_current_{}", std::process::id()));
+        fs_err::create_dir_all(&dir).unwrap();
+        fs_err::write(dir.join("Boot0001.bin"), hex::decode(MISC_DEVICE).unwrap()).unwrap();
+        fs_err::write(dir.join("Boot0007.bin"), ubuntu_boot_option()).unwrap();
+        let machine_with = |boot_current: u16| -> Machine {
+            fs_err::write(dir.join("BootCurrent.bin"), boot_current.to_le_bytes()).unwrap();
+            serde_json::from_value(serde_json::json!({
+                "measure_config": {
+                    "bootmode": "indirect",
+                    "path_boot_xxxx": dir.to_str().unwrap(),
+                    "boot_current": dir.join("BootCurrent.bin").to_str().unwrap(),
+                }
+            })).unwrap()
+        };
+        let fallback = machine_with(0x0001).shim_fallback();
+        let normal = machine_with(0x0007).shim_fallback();
+        let _ = fs_err::remove_dir_all(&dir);
+        assert!(fallback.unwrap());
+        assert!(!normal.unwrap());
     }
 }

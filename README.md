@@ -29,9 +29,19 @@ ACPI tables blob) subcommands.
       --json                       Output JSON
       --json-file <JSON_FILE>      Output JSON to file
       --transcript <TRANSCRIPT>    Generate a human-readable transcript of all metadata files and write to the specified file
+      --compare-eventlog[=<CCEL>]  Compare the computed events with a TDX CCEL event log and explain mismatches. Without a value, reads the running TD's log (/sys/firmware/acpi/tables/data/CCEL)
   -h, --help                       Print help
   -V, --version                    Print version
 ```
+
+`--compare-eventlog` replays the event log and aligns it event-by-event with the
+events computed by `tdx-measure`, marking each as matching (`=`), only in the log
+(`-`) or only computed (`+`). For a mismatching GPT event it dumps the GPT from the
+log next to the GPT read from the disk; for a mismatching initrd it reports whether
+the initrd file was modified after boot and which `initrd*` file (if any) matches.
+A log file path must be given with `=` (e.g. `--compare-eventlog=CCEL.bin`).
+Running with `RUST_LOG=debug` additionally dumps the raw GPT event data computed
+from the disk.
 
 The boot mode (`direct` vs `indirect`) is determined by the `bootmode` field inside `measure_config` in the metadata file.
 
@@ -48,7 +58,15 @@ The `gen-metadata` subcommand parses a raw QEMU command line (via the bundled `q
 tdx-measure gen-metadata --qemu-command <FILE> --boot-mode <direct|indirect> [--tdvf-after-202411] [-o metadata.json]
 ```
 
-`--qemu-command` points to a file containing the QEMU invocation. `--boot-mode` selects the boot chain and seeds the matching `measure_config` placeholder paths. `--tdvf-after-202411` marks the firmware as the 202411 build or newer (otherwise older firmware is assumed). The parsed VM shape is written to `qemu_options`; fill in the placeholder measurement-input paths afterwards.
+`--qemu-command` points to a file containing the QEMU invocation: a shell command line, or a running QEMU's `/proc/PID/cmdline` copied as-is (`cp /proc/PID/cmdline FILE`) or one argument per line (`tr '\0' '\n'`). Don't copy `cat /proc/PID/cmdline` from a terminal: that drops the argument separators, and `gen-metadata` rejects such a file. `--boot-mode` selects the boot chain and seeds the matching `measure_config` placeholder paths. `--tdvf-after-202411` marks the firmware as the 202411 build or newer (otherwise older firmware is assumed). The parsed VM shape is written to `qemu_options`; fill in the placeholder measurement-input paths afterwards.
+
+Inside a running TD, `--in-guest` (indirect boot only) fills in `measure_config` instead of emitting placeholders: it points at the files written by [`extract_config_files.py`](extract_config_files.py) into `--dir` (default `.`), sets `cmdline` from `/proc/cmdline`, and sets `disk` to the disk backing `/boot/efi` (override with `--disk`; `--rootfs` defaults to `/`). `qemu_options` still comes from `--qemu-command`, so pass the QEMU command line the TD was launched with, then copy the host's OVMF image into the TD and point `qemu_options.bios` at it:
+
+```
+cd workdir && sudo python3 ../extract_config_files.py
+sudo tdx-measure gen-metadata --qemu-command command --boot-mode indirect --in-guest
+sudo tdx-measure metadata.json --compare-eventlog
+```
 
 ### Direct Boot
 
@@ -79,11 +97,12 @@ Create `metadata.json` file with the below metadata:
 
 - `qemu_options`: VM shape used to compute MRTD and RTMR[0] and (when generating ACPI tables) to launch QEMU.
   - `smp` *(optional)*: value passed verbatim to `-smp`, either a bare CPU count (`"16"`) or a full topology (`"48,sockets=1,dies=1,cores=24,threads=2"`). The topology affects the guest ACPI (MADT/SRAT), so preserve it verbatim. Defaults to a single CPU when absent.
-  - `memory`: The amount of memory allocated to the TD (e.g., "2G" for 2 gigabytes).
+  - `memory`: The amount of memory allocated to the TD (e.g., "2G" for 2 gigabytes). As with QEMU `-m`, a value without a suffix is in MiB ("16384" = 16 GiB).
   - `bios`: Path to file (e.g., `OVMF.fd`) containing a virtual BIOS, which is used to boot the TD image.
     The file can be obtained by setting up the host OS following [these instructions](https://github.com/canonical/tdx/tree/main?tab=readme-ov-file#4-setup-host-os) and retrieving it from `/usr/share/ovmf/OVMF.fd`.
 - `measure_config`: Measurement inputs. `bootmode` is `direct`.
   - `tdvf_before_202411` *(optional, default `true`)*: set to `false` when the TDVF firmware is the 202411 build or newer. When true, the separator event from RTMR1 is moved to the end of the RTMR0 measurement log.
+  - `secure_boot` *(optional)*: override for the `SecureBoot` UEFI variable value (`false`/`true`). Normally omit it: the Secure Boot variables measured into RTMR[0] (`SecureBoot`, `PK`, `KEK`, `db`, `dbx`, `dbt`) are derived from the OVMF image. `SecureBoot` only exists when OVMF is built with Secure Boot support (detected via `SecureBootConfigDxe`), and the keys come from the variable store in its CFV.
   - `acpi_tables_bin`: Path to a file containing ACPI tables, which describe the hardware configuration and device tree that the TD uses to discover and configure hardware.
     By using the `gen-acpi` subcommand of the `tdx-measure` tool, the ACPI tables are generated automatically and stored to a file at the path provided by `acpi_tables_bin`.
     Alternatively, a file containing the ACPI tables can be extracted by running the [`extract_config_files.py`](extract_config_files.py) script inside a TD, which is configured identically to the target configuration.
@@ -168,11 +187,12 @@ Create `metadata.json` file with the below metadata:
 
 - `qemu_options`: VM shape used to compute MRTD and RTMR[0]
   - `cpus`: Number of virtual CPUs allocated to the TD.
-  - `memory`: The amount of memory allocated to the TD (e.g., "2G" for 2 gigabytes).
+  - `memory`: The amount of memory allocated to the TD (e.g., "2G" for 2 gigabytes). As with QEMU `-m`, a value without a suffix is in MiB ("16384" = 16 GiB).
   - `bios`: Path to file (e.g., `OVMF.fd`) containing a virtual BIOS, which is used to boot the TD image.
     The file can be obtained by setting up the host OS following [these instructions](https://github.com/canonical/tdx/tree/main?tab=readme-ov-file#4-setup-host-os) and retrieving it from `/usr/share/ovmf/OVMF.fd`.
 - `measure_config`: Measurement inputs. `bootmode` is `indirect`.
   - `tdvf_before_202411` *(optional, default `true`)*: set to `false` when the TDVF firmware is the 202411 build or newer. When true, the separator event from RTMR1 is moved to the end of the RTMR0 measurement log.
+  - `secure_boot` *(optional)*: override for the `SecureBoot` UEFI variable value (`false`/`true`). Normally omit it: the Secure Boot variables measured into RTMR[0] (`SecureBoot`, `PK`, `KEK`, `db`, `dbx`, `dbt`) are derived from the OVMF image. `SecureBoot` only exists when OVMF is built with Secure Boot support (detected via `SecureBootConfigDxe`), and the keys come from the variable store in its CFV.
   - `acpi_tables_bin`: Path to file containing ACPI tables, which describe the hardware configuration and device tree that the TD uses to discover and configure hardware.
     The file can be extracted by running the [`extract_config_files.py`](extract_config_files.py) script inside a TD, which is configured identically to the target configuration.
   - `rsdp`: Path to file containing a Root System Description Pointer (RSDP), which is an ACPI data structure that provides the address of the RSDT/XSDT table.
@@ -184,6 +204,8 @@ Create `metadata.json` file with the below metadata:
   - `path_boot_xxxx`: Path to directory containing files (e.g., `Boot0000.bin`, `Boot0001.bin`, `Boot0002.bin`) for each Boot#### UEFI variables.
     Each variable defines a specific boot option with its device path and description.
     These files can be extracted by running the [`extract_config_files.py`](extract_config_files.py) script inside a TD, which is configured identically to the target configuration.
+  - `boot_current` *(optional, in-guest)*: Path to file containing the UEFI BootCurrent variable, captured by [`extract_config_files.py`](extract_config_files.py). Used to detect a shim fallback boot (see `shim_fallback`).
+  - `shim_fallback` *(optional)*: override for whether firmware boots via shim's fallback path, `\EFI\BOOT\BOOTX64.EFI` → `fbx64.efi` → `\EFI\ubuntu\shimx64.efi`. OVMF does this when no OS boot entry exists, i.e. when the ESP has no `/NvVars` (e.g. the first boot of a fresh image). Such a boot additionally measures BOOTX64.EFI and fbx64.efi into RTMR[1], measures the MOK variables twice in RTMR[2] and SbatLevel twice in RTMR[0], and the boot entries created by fbx64.efi are not part of the measured BootOrder. Normally omit it: in-guest it is detected from `boot_current` (the booted entry has no file path), and with `qcow2` it is predicted from whether `/boot/efi/NvVars` exists in the image.
 
 - `measure_config` *(indirect fields)*: used to compute RTMR[1] and RTMR[2]
   - `qcow2`: Path to guest OS disk image in QCOW2 format.

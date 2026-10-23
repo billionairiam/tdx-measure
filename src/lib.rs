@@ -9,14 +9,17 @@ use serde_human_bytes as hex_bytes;
 use anyhow::{anyhow, Result};
 
 pub use machine::Machine;
+pub use image::describe_gpt_event_data;
 
 use util::{measure_log, measure_sha384};
 
 mod acpi;
+pub mod eventlog;
 mod kernel;
 mod image;
 mod machine;
 mod num;
+mod secure_boot;
 mod tdvf;
 mod util;
 
@@ -110,6 +113,21 @@ pub struct MeasureConfig {
     /// Defaults to true (older firmware).
     #[serde(default = "default_true")]
     pub tdvf_before_202411: bool,
+    /// Overrides the `SecureBoot` UEFI variable value measured into RTMR0.
+    /// By default it is derived from the OVMF image (absent when OVMF is built
+    /// without Secure Boot support, otherwise from its enrolled keys).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secure_boot: Option<bool>,
+    /// Overrides whether firmware boots via shim's fallback path
+    /// (`\EFI\BOOT\BOOTX64.EFI` -> `fbx64.efi` -> `\EFI\ubuntu\shimx64.efi`).
+    /// OVMF does this when no OS boot entry exists, i.e. when the ESP holds no
+    /// `/NvVars`. By default it is detected from `boot_current` (in-guest) or
+    /// from the presence of `/boot/efi/NvVars` in `qcow2` (host).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shim_fallback: Option<bool>,
+    /// Path to the captured `BootCurrent` variable (in-guest measurement).
+    #[serde(default, skip_serializing_if = "is_none_or_empty")]
+    pub boot_current: Option<String>,
     /// Path to the generated ACPI tables binary (measurement input).
     #[serde(skip_serializing_if = "is_none_or_empty")]
     pub acpi_tables_bin: Option<String>,
@@ -163,8 +181,9 @@ fn is_none_or_empty(s: &Option<String>) -> bool {
 }
 
 /// Parse a memory size value that can be decimal or hexadecimal (with 0x prefix),
-/// with optional K/M/G/T suffix.
+/// with optional K/M/G/T suffix. Like QEMU's `-m`, a value without a suffix is in MiB.
 pub fn parse_memory_size(s: &str) -> Result<u64> {
+    const MIB: u64 = 1024 * 1024;
     let s = s.trim();
 
     if s.is_empty() {
@@ -172,12 +191,15 @@ pub fn parse_memory_size(s: &str) -> Result<u64> {
     }
     if s.starts_with("0x") || s.starts_with("0X") {
         let hex_str = &s[2..];
-        return u64::from_str_radix(hex_str, 16)
-            .map_err(|e| anyhow!("Invalid hexadecimal value: {}", e));
+        let mib = u64::from_str_radix(hex_str, 16)
+            .map_err(|e| anyhow!("Invalid hexadecimal value: {}", e))?;
+        return mib.checked_mul(MIB).ok_or_else(|| anyhow!("Memory size overflow"));
     }
 
     if s.chars().all(|c| c.is_ascii_digit()) {
-        return Ok(s.parse::<u64>()?);
+        return s.parse::<u64>()?
+            .checked_mul(MIB)
+            .ok_or_else(|| anyhow!("Memory size overflow"));
     }
     let len = s.len();
     let (num_part, suffix) = match s.chars().last().unwrap() {
@@ -190,4 +212,16 @@ pub fn parse_memory_size(s: &str) -> Result<u64> {
 
     let num = num_part.parse::<u64>()?;
     Ok(num * suffix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_memory_size;
+
+    #[test]
+    fn memory_size_without_suffix_is_mib() {
+        assert_eq!(parse_memory_size("16384").unwrap(), 16 << 30);
+        assert_eq!(parse_memory_size("0x400").unwrap(), 1 << 30);
+        assert_eq!(parse_memory_size("16384M").unwrap(), parse_memory_size("16G").unwrap());
+    }
 }

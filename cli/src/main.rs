@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 mod transcript;
 mod gen_metadata;
+mod eventlog_compare;
 use transcript::generate_transcript;
 
 #[derive(Parser)]
@@ -45,6 +46,13 @@ struct MeasureArgs {
     /// Generate a human-readable transcript of all metadata files and write to the specified file
     #[arg(long)]
     transcript: Option<PathBuf>,
+
+    /// Compare the computed events with a TDX CCEL event log and explain
+    /// mismatches. Without a value, reads the running TD's log
+    /// (/sys/firmware/acpi/tables/data/CCEL).
+    #[arg(long, value_name = "CCEL", num_args = 0..=1, require_equals = true,
+          default_missing_value = eventlog_compare::DEFAULT_CCEL)]
+    compare_eventlog: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -63,6 +71,20 @@ enum Commands {
         /// Path to write the generated metadata.json.
         #[arg(short, long, default_value = "metadata.json")]
         output: PathBuf,
+        /// Run inside the TD: point `measure_config` at the files written by
+        /// extract_config_files.py (see --dir) and take the kernel cmdline and
+        /// boot disk from the running guest. Requires --boot-mode indirect.
+        #[arg(long)]
+        in_guest: bool,
+        /// Directory with the extract_config_files.py output.
+        #[arg(short, long, default_value = ".", requires = "in_guest")]
+        dir: PathBuf,
+        /// Raw boot disk (default: the disk backing /boot/efi).
+        #[arg(long, requires = "in_guest")]
+        disk: Option<String>,
+        /// Guest filesystem root.
+        #[arg(long, default_value = "/", requires = "in_guest")]
+        rootfs: String,
     },
 
     /// Generate ACPI tables with QEMU for the guest distribution and write them
@@ -106,6 +128,10 @@ fn run_measure(args: &MeasureArgs) -> Result<()> {
 
     // Output results
     output_measurements(args, &measurements)?;
+
+    if let Some(ref ccel) = args.compare_eventlog {
+        eventlog_compare::compare_eventlog(&machine, ccel)?;
+    }
 
     Ok(())
 }
@@ -173,8 +199,15 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match &cli.command {
-        Some(Commands::GenMetadata { qemu_command, boot_mode, tdvf_after_202411, output }) => {
-            gen_metadata::run(qemu_command, boot_mode, !*tdvf_after_202411, output)?;
+        Some(Commands::GenMetadata {
+            qemu_command, boot_mode, tdvf_after_202411, output, in_guest, dir, disk, rootfs,
+        }) => {
+            let guest = in_guest.then(|| gen_metadata::GuestOptions {
+                dir: dir.clone(),
+                disk: disk.clone(),
+                rootfs: rootfs.clone(),
+            });
+            gen_metadata::run(qemu_command, boot_mode, !*tdvf_after_202411, output, guest.as_ref())?;
         }
         Some(Commands::GenAcpi { metadata, distribution, qemu_version }) => {
             run_gen_acpi(metadata, distribution, qemu_version)?;

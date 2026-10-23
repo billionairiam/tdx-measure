@@ -32,6 +32,7 @@ object = "0.38"
 hex-literal = "1.1"
 fs-err = { workspace = true }
 log = "0.4"
+lzma-rs = "0.3"
 
 [dev-dependencies]
 serde_json = { workspace = true }

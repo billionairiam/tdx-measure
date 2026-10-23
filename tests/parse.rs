@@ -66,6 +66,9 @@ fn machine_for(fixture: &Path) -> Machine {
         machine.measure_config = Some(tdx_measure::MeasureConfig {
             bootmode: "direct".into(),
             tdvf_before_202411: false,
+            secure_boot: None,
+            shim_fallback: None,
+            boot_current: None,
             acpi_tables_bin: Some(String::new()),
             rsdp: None,
             table_loader: None,

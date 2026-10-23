@@ -5,11 +5,13 @@
 
 //! Generate a `metadata.json` (Machine) from a raw QEMU command line.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use fs_err as fs;
 use qcparser::{Grouped, Props};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tdx_measure::{Machine, MeasureConfig, QemuOptions};
+
+const BIOS_PLACEHOLDER: &str = "[Path to OVMF.fd]";
 
 /// Render a grouped property map back into a QEMU comma-separated option value,
 /// placing the positional value (driver/type/model/...) first.
@@ -38,8 +40,9 @@ fn machine_from_grouped(g: &Grouped, boot_mode: &str, tdvf_before_202411: bool) 
         .as_ref()
         .and_then(|m| m.get("size"))
         .cloned()
-        .unwrap_or_else(|| "2G".to_string());
-    let bios = g.bios.clone().unwrap_or_default();
+        // QEMU's default guest RAM size when `-m` is omitted.
+        .unwrap_or_else(|| "128M".to_string());
+    let bios = g.bios.clone().unwrap_or_else(|| BIOS_PLACEHOLDER.to_string());
 
     let qemu_options = QemuOptions {
         memory,
@@ -74,6 +77,9 @@ fn machine_from_grouped(g: &Grouped, boot_mode: &str, tdvf_before_202411: bool) 
     let measure_config = MeasureConfig {
         bootmode: boot_mode.to_string(),
         tdvf_before_202411,
+        secure_boot: None,
+        shim_fallback: None,
+        boot_current: None,
         acpi_tables_bin: Some("[Path to acpi_tables_bin]".to_string()),
         rsdp: opt(indirect, "[Path to rsdp]"),
         table_loader: opt(indirect, "[Path to table_loader]"),
@@ -99,15 +105,218 @@ fn machine_from_grouped(g: &Grouped, boot_mode: &str, tdvf_before_202411: bool) 
 }
 
 /// Parse a QEMU command from `qemu_command` and write `metadata.json` to `output`.
-pub fn run(qemu_command: &Path, boot_mode: &str, tdvf_before_202411: bool, output: &Path) -> Result<()> {
+///
+/// With `in_guest` set this runs inside the TD: `measure_config` points at the
+/// files written by `extract_config_files.py` and the kernel cmdline and boot
+/// disk are taken from the running guest.
+pub fn run(
+    qemu_command: &Path,
+    boot_mode: &str,
+    tdvf_before_202411: bool,
+    output: &Path,
+    in_guest: Option<&GuestOptions>,
+) -> Result<()> {
+    run_with(qemu_command, boot_mode, tdvf_before_202411, output, in_guest, &GuestSources::default())
+}
+
+fn run_with(
+    qemu_command: &Path,
+    boot_mode: &str,
+    tdvf_before_202411: bool,
+    output: &Path,
+    in_guest: Option<&GuestOptions>,
+    sources: &GuestSources,
+) -> Result<()> {
     let command = fs::read_to_string(qemu_command)
         .with_context(|| format!("Failed to read QEMU command: {}", qemu_command.display()))?;
+    let tokens = qcparser::tokenizer::tokenize(&command);
+    if !tokens.iter().any(|t| t.starts_with('-')) {
+        bail!(
+            "No QEMU options found in {}: the argument separators appear to be lost \
+             (e.g. /proc/PID/cmdline printed to a terminal drops its NUL separators). \
+             Capture it with `cp /proc/PID/cmdline FILE` or `tr '\\0' ' ' < /proc/PID/cmdline > FILE`",
+            qemu_command.display()
+        );
+    }
     let grouped = qcparser::parse(&command);
-    let machine = machine_from_grouped(&grouped, boot_mode, tdvf_before_202411);
+    if grouped.bios.is_none() {
+        eprintln!("warning: no -bios in the QEMU command; set qemu_options.bios to the OVMF image");
+    }
+    let mut machine = machine_from_grouped(&grouped, boot_mode, tdvf_before_202411);
+    if let Some(opts) = in_guest {
+        if boot_mode != "indirect" {
+            bail!("--in-guest requires --boot-mode indirect");
+        }
+        let mc = machine.measure_config.as_mut().expect("measure_config is always set");
+        fill_from_guest(mc, opts, sources)?;
+        let bios = &machine.qemu_options.as_ref().expect("qemu_options is always set").bios;
+        if !Path::new(bios).is_file() {
+            eprintln!(
+                "warning: bios {bios} does not exist in this TD; copy the host's OVMF image here \
+                 and update qemu_options.bios (needed for MRTD/RTMR0)"
+            );
+        }
+    }
     let json = serde_json::to_string_pretty(&machine)
         .context("Failed to serialize metadata")?;
     fs::write(output, json)
         .with_context(|| format!("Failed to write metadata: {}", output.display()))?;
     eprintln!("metadata written to {}", output.display());
     Ok(())
+}
+
+/// Options for generating metadata inside a running TD.
+pub struct GuestOptions {
+    /// Directory with the files written by `extract_config_files.py`.
+    pub dir: PathBuf,
+    /// Raw boot disk; detected from the `/boot/efi` mount when `None`.
+    pub disk: Option<String>,
+    /// Guest filesystem root.
+    pub rootfs: String,
+}
+
+/// Roots of the running guest's kernel interfaces (overridable for tests).
+struct GuestSources {
+    sys: PathBuf,
+    proc: PathBuf,
+}
+
+impl Default for GuestSources {
+    fn default() -> Self {
+        Self { sys: "/sys".into(), proc: "/proc".into() }
+    }
+}
+
+/// Point `mc` at the files extracted by `extract_config_files.py` into
+/// `opts.dir`, and take the kernel cmdline and boot disk from the running guest.
+fn fill_from_guest(mc: &mut MeasureConfig, opts: &GuestOptions, src: &GuestSources) -> Result<()> {
+    let dir = fs::canonicalize(&opts.dir)?;
+    let mut missing = Vec::new();
+    let mut file = |field: &mut Option<String>, name: &str, optional: bool| {
+        let path = dir.join(name);
+        if path.is_file() {
+            *field = Some(path.to_string_lossy().into_owned());
+        } else {
+            missing.push(path.display().to_string());
+            // Optional inputs are simply not measured when absent.
+            if optional {
+                *field = None;
+            }
+        }
+    };
+    file(&mut mc.acpi_tables_bin, "acpi_tables.bin", false);
+    file(&mut mc.rsdp, "rsdp.bin", false);
+    file(&mut mc.table_loader, "table_loader.bin", false);
+    file(&mut mc.boot_order, "BootOrder.bin", false);
+    file(&mut mc.boot_current, "BootCurrent.bin", true);
+    file(&mut mc.mok_list, "MokListRT.bin", true);
+    file(&mut mc.mok_list_trusted, "MokListTrustedRT.bin", true);
+    file(&mut mc.mok_list_x, "MokListXRT.bin", true);
+    file(&mut mc.sbat_level, "SbatLevelRT.bin", true);
+    if !missing.is_empty() {
+        eprintln!(
+            "warning: missing extracted files (run extract_config_files.py in {} first): {}",
+            dir.display(),
+            missing.join(", ")
+        );
+    }
+    mc.path_boot_xxxx = Some(dir.to_string_lossy().into_owned());
+
+    mc.cmdline = Some(fs::read_to_string(src.proc.join("cmdline"))?.trim().to_string());
+    let disk = match opts.disk.clone().or_else(|| detect_boot_disk(src)) {
+        Some(disk) => disk,
+        None => bail!("could not find the disk backing /boot/efi; pass --disk"),
+    };
+    if std::fs::File::open(&disk).is_err() {
+        eprintln!("warning: {disk} is not readable; run tdx-measure as root");
+    }
+    mc.disk = Some(disk);
+    mc.rootfs = Some(opts.rootfs.clone());
+    mc.qcow2 = None;
+    Ok(())
+}
+
+/// Return the whole-disk device (e.g. `/dev/vda`) backing the ESP at `/boot/efi`.
+fn detect_boot_disk(src: &GuestSources) -> Option<String> {
+    let mounts = fs::read_to_string(src.proc.join("mounts")).ok()?;
+    let source = mounts.lines().find_map(|l| {
+        let mut f = l.split_whitespace();
+        let (dev, mnt) = (f.next()?, f.next()?);
+        (mnt == "/boot/efi").then_some(dev)
+    })?;
+    // Resolve /dev/disk/by-* symlinks to the kernel device name.
+    let dev = std::fs::canonicalize(source).unwrap_or_else(|_| PathBuf::from(source));
+    let name = dev.file_name()?.to_str()?.to_string();
+    let block = std::fs::canonicalize(src.sys.join("class/block").join(&name)).ok()?;
+    let disk = if block.join("partition").exists() {
+        block.parent()?.file_name()?.to_str()?.to_string()
+    } else {
+        name
+    };
+    Some(format!("/dev/{disk}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_command_without_separators() {
+        let dir = std::env::temp_dir().join(format!("gen-metadata-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let cmd = dir.join("command");
+        fs::write(&cmd, "/usr/bin/qemu-system-x86_64-accelkvm-m100G-smp32-bios/usr/share/ovmf/OVMF.fd").unwrap();
+        let err = run(&cmd, "indirect", false, &dir.join("metadata.json"), None).unwrap_err();
+        assert!(err.to_string().contains("separators"));
+        assert!(!dir.join("metadata.json").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn in_guest_uses_extracted_files_and_guest_state() {
+        let root = std::env::temp_dir().join(format!("gen-metadata-guest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (sys, proc, work) = (root.join("sys"), root.join("proc"), root.join("work"));
+        let write = |p: PathBuf, data: &[u8]| {
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, data).unwrap();
+        };
+        for f in ["acpi_tables.bin", "rsdp.bin", "table_loader.bin", "BootOrder.bin", "BootCurrent.bin", "MokListRT.bin"] {
+            write(work.join(f), b"x");
+        }
+        write(sys.join("devices/virtio1/block/vda/vda15/partition"), b"15");
+        fs::create_dir_all(sys.join("class/block")).unwrap();
+        std::os::unix::fs::symlink(
+            sys.join("devices/virtio1/block/vda/vda15"),
+            sys.join("class/block/vda15"),
+        )
+        .unwrap();
+        write(proc.join("cmdline"), b"BOOT_IMAGE=/vmlinuz ro\n");
+        write(proc.join("mounts"), b"/dev/vda1 / ext4 rw 0 0\n/dev/vda15 /boot/efi vfat rw 0 0\n");
+        write(root.join("command"), b"qemu -m 16G -smp 4 -bios /OVMF.fd");
+
+        let meta = root.join("metadata.json");
+        let opts = GuestOptions { dir: work.clone(), disk: None, rootfs: "/".into() };
+        let sources = GuestSources { sys, proc };
+        run_with(&root.join("command"), "indirect", true, &meta, Some(&opts), &sources).unwrap();
+
+        let machine: Machine = serde_json::from_str(&fs::read_to_string(&meta).unwrap()).unwrap();
+        let qo = machine.qemu_options.unwrap();
+        assert_eq!((qo.memory.as_str(), qo.smp.as_deref()), ("16G", Some("4")));
+        let mc = machine.measure_config.unwrap();
+        let work = fs::canonicalize(&work).unwrap();
+        let file = |name: &str| Some(work.join(name).to_string_lossy().into_owned());
+        assert_eq!(mc.acpi_tables_bin, file("acpi_tables.bin"));
+        assert_eq!(mc.boot_current, file("BootCurrent.bin"));
+        assert_eq!(mc.path_boot_xxxx, Some(work.to_string_lossy().into_owned()));
+        assert_eq!(mc.mok_list, file("MokListRT.bin"));
+        assert_eq!(mc.mok_list_x, None);
+        assert_eq!(mc.cmdline.as_deref(), Some("BOOT_IMAGE=/vmlinuz ro"));
+        assert_eq!(mc.disk.as_deref(), Some("/dev/vda"));
+        assert_eq!(mc.qcow2, None);
+
+        let err = run_with(&root.join("command"), "direct", true, &meta, Some(&opts), &sources).unwrap_err();
+        assert!(err.to_string().contains("indirect"));
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

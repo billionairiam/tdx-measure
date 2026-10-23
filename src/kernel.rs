@@ -3,7 +3,7 @@
  * Copyright (c) 2025 Tinfoil Inc
  * SPDX-License-Identifier: Apache-2.0
  */
-use crate::{measure_log, measure_sha384, util::debug_print_log, util::authenticode_sha384_hash};
+use crate::{measure_sha384, util::debug_print_log, util::authenticode_sha384_hash};
 use anyhow::{bail, Context, Result};
 use fs_err as fs;
 
@@ -92,14 +92,14 @@ fn patch_kernel(
     Ok(kd)
 }
 
-/// Measures a QEMU-patched TDX kernel image from file paths (for direct boot).
-pub(crate) fn measure_rtmr1_direct(
+/// RTMR1 event digests for a QEMU-patched TDX kernel image (direct boot).
+pub(crate) fn rtmr1_log_direct(
     kernel_path: &str,
     initrd_path: &str,
     mem_size: u64,
     acpi_data_size: u32,
     include_separator: bool,
-) -> Result<Vec<u8>> {
+) -> Result<Vec<Vec<u8>>> {
 
     // Read kernel and initrd files
     let kernel_data = fs::read(kernel_path).context("Failed to read kernel file")?;
@@ -123,14 +123,14 @@ pub(crate) fn measure_rtmr1_direct(
     rtmr1_log.push(measure_sha384(b"Exit Boot Services Returned with Success"));
 
     debug_print_log("RTMR1", &rtmr1_log);
-    Ok(measure_log(&rtmr1_log))
+    Ok(rtmr1_log)
 }
 
-/// Measures RTMR2 for direct boot from file paths.
-pub(crate) fn measure_rtmr2_direct(
+/// RTMR2 event digests for direct boot.
+pub(crate) fn rtmr2_log_direct(
     initrd_path: &str,
     kernel_cmdline: &str,
-) -> Result<Vec<u8>> {
+) -> Result<Vec<Vec<u8>>> {
 
     // Reads our initrd file
     let initrd_data = fs::read(initrd_path).context("Failed to read initrd file")?;
@@ -145,5 +145,5 @@ pub(crate) fn measure_rtmr2_direct(
     ];
 
     debug_print_log("RTMR2", &rtmr2_log);
-    Ok(measure_log(&rtmr2_log))
+    Ok(rtmr2_log)
 }

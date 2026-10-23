@@ -120,10 +120,18 @@ def main():
             boot_order_data = f.read()
         boot_entries = parse_boot_order(boot_order_data)
 
+    # BootCurrent tells whether this boot went through shim's fallback path
+    extracted_variables = [boot_order_var]  # BootOrder is always extracted
+    if extract_boot_variable("BootCurrent", "BootCurrent.bin"):
+        extracted_variables.append("BootCurrent")
+        with open("BootCurrent.bin", 'rb') as f:
+            boot_current = struct.unpack('<H', f.read(2))[0]
+        if boot_current not in boot_entries:
+            boot_entries.append(boot_current)
+
     print(f"\nExtracting Boot variables for entries: {[f'Boot{entry:04X}' for entry in boot_entries]}")
 
     # Extract boot variables dynamically based on BootOrder
-    extracted_variables = [boot_order_var]  # BootOrder is always extracted
     for boot_entry_num in boot_entries:
         boot_entry_var = f"Boot{boot_entry_num:04X}"
         if extract_boot_variable(boot_entry_var, boot_entry_var + ".bin"):

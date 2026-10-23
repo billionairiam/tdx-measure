@@ -39,6 +39,13 @@ pub fn generate_transcript(output_file: &Path, machine: &Machine, platform_only:
 
         // Display MOK variables and SBAT level for indirect boot
         if !direct_boot {
+            writeln!(output, "=== GPT (EV_EFI_GPT_EVENT, RTMR1) ===").unwrap();
+            match machine.gpt_event_data() {
+                Ok(gpt) => write!(output, "{}", tdx_measure::describe_gpt_event_data(&gpt)).unwrap(),
+                Err(e) => writeln!(output, "Failed to read GPT: {e:#}").unwrap(),
+            }
+            writeln!(output).unwrap();
+
             if let Some(mc) = &machine.measure_config {
                 if let (Some(mok_list), Some(mok_list_trusted), Some(mok_list_x)) =
                     (&mc.mok_list, &mc.mok_list_trusted, &mc.mok_list_x)

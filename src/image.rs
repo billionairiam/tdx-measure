@@ -3,7 +3,7 @@
  * Copyright (c) 2025 Tinfoil Inc
  * SPDX-License-Identifier: Apache-2.0
  */
-use crate::{measure_log, measure_sha384, util::{debug_print_log, authenticode_sha384_hash}};
+use crate::{measure_sha384, util::{debug_print_log, authenticode_sha384_hash}};
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::Path;
@@ -104,6 +104,25 @@ impl ImageSource<'_> {
         }
     }
 
+    /// Whether a regular file exists in the guest filesystem (absolute guest path).
+    pub fn file_exists(&self, guest_path: &str) -> Result<bool> {
+        match self {
+            ImageSource::Qcow2(qcow2) => {
+                let output = Command::new(guestfish_bin()?)
+                    .args(["--ro", "-a", qcow2, "-i", "is-file", guest_path])
+                    .output()
+                    .context(format!("Failed to check {}", guest_path))?;
+                if !output.status.success() {
+                    bail!("Failed to check {}: {}", guest_path, String::from_utf8_lossy(&output.stderr));
+                }
+                Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
+            }
+            ImageSource::Local { rootfs, .. } => {
+                Ok(Path::new(rootfs).join(guest_path.trim_start_matches('/')).is_file())
+            }
+        }
+    }
+
     /// Read `len` raw bytes at byte `offset` from the boot disk.
     fn read_disk(&self, len: usize, offset: u64) -> Result<Vec<u8>> {
         match self {
@@ -121,8 +140,69 @@ impl ImageSource<'_> {
     }
 }
 
+fn format_guid(b: &[u8]) -> String {
+    format!(
+        "{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{}",
+        u32::from_le_bytes(b[0..4].try_into().unwrap()),
+        u16::from_le_bytes(b[4..6].try_into().unwrap()),
+        u16::from_le_bytes(b[6..8].try_into().unwrap()),
+        b[8], b[9],
+        b[10..16].iter().map(|x| format!("{x:02X}")).collect::<String>(),
+    )
+}
+
+/// Human-readable dump of EV_EFI_GPT_EVENT data (EFI_GPT_DATA): decoded
+/// header and partitions, digest, and a full hex dump that can be diffed
+/// against the event log.
+pub fn describe_gpt_event_data(data: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let u32_at = |o: usize| u32::from_le_bytes(data[o..o + 4].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_le_bytes(data[o..o + 8].try_into().unwrap());
+    writeln!(out, "EV_EFI_GPT_EVENT data: {} bytes, SHA384 {}", data.len(), hex::encode(measure_sha384(data))).unwrap();
+    if data.len() >= 100 {
+        writeln!(out, "  Revision                 : {:#010x}", u32_at(8)).unwrap();
+        writeln!(out, "  HeaderSize               : {}", u32_at(12)).unwrap();
+        writeln!(out, "  HeaderCRC32              : {:#010x}", u32_at(16)).unwrap();
+        writeln!(out, "  MyLBA                    : {:#x}", u64_at(24)).unwrap();
+        writeln!(out, "  AlternateLBA             : {:#x}", u64_at(32)).unwrap();
+        writeln!(out, "  FirstUsableLBA           : {:#x}", u64_at(40)).unwrap();
+        writeln!(out, "  LastUsableLBA            : {:#x}", u64_at(48)).unwrap();
+        writeln!(out, "  DiskGUID                 : {}", format_guid(&data[56..72])).unwrap();
+        writeln!(out, "  PartitionEntryLBA        : {:#x}", u64_at(72)).unwrap();
+        writeln!(out, "  NumberOfPartitionEntries : {}", u32_at(80)).unwrap();
+        writeln!(out, "  SizeOfPartitionEntry     : {}", u32_at(84)).unwrap();
+        writeln!(out, "  PartitionEntryArrayCRC32 : {:#010x}", u32_at(88)).unwrap();
+        writeln!(out, "  NumberOfPartitions       : {}", u64_at(92)).unwrap();
+        for (i, e) in data[100..].chunks_exact(128).enumerate() {
+            let name: Vec<u16> = e[56..128].chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .take_while(|&c| c != 0)
+                .collect();
+            writeln!(
+                out,
+                "  Partition[{i}] type {} unique {} LBA {:#x}-{:#x} attr {:#x} name \"{}\"",
+                format_guid(&e[0..16]),
+                format_guid(&e[16..32]),
+                u64::from_le_bytes(e[32..40].try_into().unwrap()),
+                u64::from_le_bytes(e[40..48].try_into().unwrap()),
+                u64::from_le_bytes(e[48..56].try_into().unwrap()),
+                String::from_utf16_lossy(&name),
+            ).unwrap();
+        }
+    }
+    for (i, chunk) in data.chunks(16).enumerate() {
+        let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02X}")).collect();
+        let ascii: String = chunk.iter()
+            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .collect();
+        writeln!(out, "  {:08X}  {:<47}  {}", i * 16, hex.join(" "), ascii).unwrap();
+    }
+    out
+}
+
 /// Extracts GPT event data in the format used by EV_EFI_GPT_EVENT
-fn extract_gpt_event_data(source: &ImageSource) -> Result<Vec<u8>> {
+pub fn extract_gpt_event_data(source: &ImageSource) -> Result<Vec<u8>> {
     // Extract GPT header from LBA 1 (skip MBR at LBA 0)
     let gpt_header = source.read_disk(512, 512).context("Failed to extract GPT header")?;
 
@@ -230,11 +310,12 @@ fn extract_kernel_version_from_cmdline(cmdline: &str) -> Result<String> {
     bail!("Could not extract kernel version from command line: {}", cmdline);
 }
 
-/// Main function to measure RTMR1 from a guest disk image
-pub fn measure_rtmr1_from_image(source: &ImageSource, include_separator: bool) -> Result<Vec<u8>> {
+/// RTMR1 event digests for indirect boot from a guest disk image
+pub fn rtmr1_log_from_image(source: &ImageSource, include_separator: bool, shim_fallback: bool) -> Result<Vec<Vec<u8>>> {
 
     // Extract bootloader files
     let gpt_data = extract_gpt_event_data(source)?;
+    debug!("{}", describe_gpt_event_data(&gpt_data));
     let shim_data = source.read_file("/boot/efi/EFI/ubuntu/shimx64.efi")?;
     let grub_data = source.read_file("/boot/efi/EFI/ubuntu/grubx64.efi")?;
 
@@ -251,41 +332,50 @@ pub fn measure_rtmr1_from_image(source: &ImageSource, include_separator: bool) -
         rtmr1_log.push(measure_sha384(&[0x00, 0x00, 0x00, 0x00])); // Separator
     }
     rtmr1_log.push(gpt_hash);
+    if shim_fallback {
+        // BOOTX64.EFI (shim) -> fbx64.efi -> shimx64.efi
+        let boot_shim = source.read_file("/boot/efi/EFI/BOOT/BOOTX64.EFI")?;
+        let fallback = source.read_file("/boot/efi/EFI/BOOT/fbx64.efi")?;
+        rtmr1_log.push(authenticode_sha384_hash(&boot_shim).context("Failed to compute BOOTX64.EFI hash")?);
+        rtmr1_log.push(authenticode_sha384_hash(&fallback).context("Failed to compute fbx64.efi hash")?);
+    }
     rtmr1_log.push(shim_hash);
     rtmr1_log.push(grub_hash);
     rtmr1_log.push(measure_sha384(b"Exit Boot Services Invocation"));
     rtmr1_log.push(measure_sha384(b"Exit Boot Services Returned with Success"));
 
     debug_print_log("RTMR1", &rtmr1_log);
-    Ok(measure_log(&rtmr1_log))
+    Ok(rtmr1_log)
 }
 
-/// Measures RTMR2 using actual MOK variable data extracted from shim
-pub fn measure_rtmr2_from_image(source: &ImageSource, cmdline: &str, ref_mok_list: Option<&str>, ref_mok_list_trusted: Option<&str>, ref_mok_list_x: Option<&str>) -> Result<Vec<u8>> {
+/// Guest path of the initrd loaded for the kernel named in `cmdline`.
+pub fn initrd_guest_path(cmdline: &str) -> Result<String> {
+    Ok(format!("/boot/initrd.img-{}", extract_kernel_version_from_cmdline(cmdline)?))
+}
 
-    // Extract kernel version from command line and construct initrd path
-    let kernel_version = extract_kernel_version_from_cmdline(cmdline)?;
-    let initrd_path = format!("/boot/initrd.img-{}", kernel_version);
+/// RTMR2 event digests using actual MOK variable data extracted from shim
+pub fn rtmr2_log_from_image(source: &ImageSource, cmdline: &str, ref_mok_list: Option<&str>, ref_mok_list_trusted: Option<&str>, ref_mok_list_x: Option<&str>, shim_fallback: bool) -> Result<Vec<Vec<u8>>> {
+
+    let initrd_path = initrd_guest_path(cmdline)?;
 
     // Extract initrd
     let initrd_data = source.read_file(&initrd_path)?;
 
     // Compute RTMR2 log. MOK variables are optional; skip any that are absent.
-    let mut rtmr2_log = Vec::new();
-    if let Some(p) = ref_mok_list {
-        rtmr2_log.push(measure_sha384(&read_file_data(p)?));
+    // Shim measures them on every run; with fallback it runs twice.
+    let mut mok_events = Vec::new();
+    for p in [ref_mok_list, ref_mok_list_x, ref_mok_list_trusted].into_iter().flatten() {
+        mok_events.push(measure_sha384(&read_file_data(p)?));
     }
-    if let Some(p) = ref_mok_list_x {
-        rtmr2_log.push(measure_sha384(&read_file_data(p)?));
-    }
-    if let Some(p) = ref_mok_list_trusted {
-        rtmr2_log.push(measure_sha384(&read_file_data(p)?));
+    let mut rtmr2_log = mok_events.clone();
+    if shim_fallback {
+        rtmr2_log.extend(mok_events);
     }
     rtmr2_log.push(measure_sha384(&utf16_encode(cmdline)));
     rtmr2_log.push(measure_sha384(&initrd_data));
 
     debug_print_log("RTMR2", &rtmr2_log);
-    Ok(measure_log(&rtmr2_log))
+    Ok(rtmr2_log)
 }
 
 #[cfg(test)]
