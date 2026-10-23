@@ -42,6 +42,10 @@ the initrd file was modified after boot and which `initrd*` file (if any) matche
 Inside a TD (`/dev/tdx_guest` present) it also reads the TDREPORT and compares the
 computed MRTD and RTMR0–2 with the running TD's registers; for the TD's own event log
 it also flags RTMRs whose log replay differs from the register.
+Every mismatching event is listed under `=== Mismatch details ===` with its full
+digest and a hex dump of the raw event-log entry. The output ends with a
+`=== RESULT ===` verdict (`SUCCESS` or `FAILURE` with the list of mismatches), and
+the command exits with status 1 on failure.
 A log file path must be given with `=` (e.g. `--compare-eventlog=CCEL.bin`).
 Running with `RUST_LOG=debug` additionally dumps the raw GPT event data computed
 from the disk.

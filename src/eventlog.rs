@@ -29,6 +29,8 @@ pub struct Event {
     pub event_type: u32,
     pub sha384: Option<Vec<u8>>,
     pub data: Vec<u8>,
+    /// The whole entry as stored in the log.
+    pub raw: Vec<u8>,
 }
 
 impl Event {
@@ -86,7 +88,7 @@ impl Event {
     }
 }
 
-fn event_type_name(t: u32) -> String {
+pub fn event_type_name(t: u32) -> String {
     let name = match t {
         0x1 => "EV_POST_CODE",
         0x3 => "EV_NO_ACTION",
@@ -172,6 +174,7 @@ pub fn parse_ccel(log: &[u8]) -> Result<Vec<Event>> {
         event_type: u32_at(4)?,
         sha384: None,
         data: spec.to_vec(),
+        raw: log[..32 + spec_size].to_vec(),
     }];
 
     let mut off = 32 + spec_size;
@@ -204,7 +207,8 @@ pub fn parse_ccel(log: &[u8]) -> Result<Vec<Event>> {
         let Some(data) = log.get(p + 4..p + 4 + size) else {
             bail!("event at offset {off:#x} exceeds the log");
         };
-        events.push(Event { index: events.len(), offset: off, mr_index, event_type, sha384, data: data.to_vec() });
+        let raw = log[off..p + 4 + size].to_vec();
+        events.push(Event { index: events.len(), offset: off, mr_index, event_type, sha384, data: data.to_vec(), raw });
         off = p + 4 + size;
     }
     Ok(events)

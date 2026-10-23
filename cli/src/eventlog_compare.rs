@@ -43,7 +43,8 @@ fn short(d: &[u8]) -> String {
     hex::encode(&d[..d.len().min(8)])
 }
 
-pub fn compare_eventlog(machine: &Machine, measurements: &TdxMeasurements, ccel: &Path) -> Result<()> {
+/// Returns whether everything that could be checked matches.
+pub fn compare_eventlog(machine: &Machine, measurements: &TdxMeasurements, ccel: &Path) -> Result<bool> {
     let raw = fs::read(ccel).context("Failed to read the event log")?;
     let events = eventlog::parse_ccel(&raw).context("Failed to parse the event log")?;
     let tool_logs = machine.rtmr_event_logs().context("Failed to compute the RTMR events")?;
@@ -52,6 +53,8 @@ pub fn compare_eventlog(machine: &Machine, measurements: &TdxMeasurements, ccel:
     println!("Legend: '=' matches, '-' only in the event log, '+' only computed by tdx-measure");
 
     let mut unmatched: Vec<&Event> = Vec::new();
+    let mut computed_only: Vec<(usize, usize, &[u8])> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
     let mut replays = Vec::new();
     for (rtmr, tool) in tool_logs.iter().enumerate() {
         let log: Vec<&Event> = events.iter().filter(|e| e.rtmr() == Some(rtmr)).collect();
@@ -60,6 +63,9 @@ pub fn compare_eventlog(machine: &Machine, measurements: &TdxMeasurements, ccel:
         let replay = eventlog::replay(&log_digests.iter().map(|d| d.to_vec()).collect::<Vec<_>>());
         let computed = eventlog::replay(tool);
         replays.push(replay.clone());
+        if replay != computed {
+            failures.push(format!("RTMR{rtmr} differs from the event log (see \"Mismatch details\")"));
+        }
         println!(
             "\nRTMR{rtmr}: {} (event log replay {}, computed {})",
             if replay == computed { "MATCH" } else { "MISMATCH" },
@@ -77,7 +83,10 @@ pub fn compare_eventlog(machine: &Machine, measurements: &TdxMeasurements, ccel:
                     println!("  -  #{:<3} [{:#010x}] {}  {}", e.index, e.offset, short(log_digests[l]), e.describe());
                     unmatched.push(e);
                 }
-                (None, Some(t)) => println!("  +  computed[{t}]       {}", short(tool_digests[t])),
+                (None, Some(t)) => {
+                    println!("  +  computed[{t}]       {}", short(tool_digests[t]));
+                    computed_only.push((rtmr, t, tool_digests[t]));
+                }
                 (None, None) => unreachable!(),
             }
         }
@@ -95,25 +104,74 @@ pub fn compare_eventlog(machine: &Machine, measurements: &TdxMeasurements, ccel:
         Err(e) => println!("\nNOTE: failed to determine shim_fallback: {e:#}"),
     }
 
-    for e in unmatched {
+    if !unmatched.is_empty() || !computed_only.is_empty() {
+        println!("\n=== Mismatch details ===");
+    }
+    for e in &unmatched {
+        dump_event(e);
         if e.event_type == EV_EFI_GPT_EVENT {
             explain_gpt(machine, e);
         } else if e.tag_id() == Some(LINUX_INITRD_TAG) {
             explain_initrd(machine, e);
         }
     }
+    for (rtmr, t, digest) in &computed_only {
+        println!("\n---- computed RTMR{rtmr} event [{t}] (not in the event log) ----");
+        println!("Digest : {}", hex::encode(digest));
+    }
 
     // The event log only covers RTMRs; the registers of the running TD also
     // give MRTD and catch extensions that are missing from the log.
+    let mut td_checked = false;
     if Path::new(TDX_GUEST_DEVICE).exists() {
         let own_log = ccel == Path::new(DEFAULT_CCEL);
         match read_tdreport() {
-            Ok(report) => compare_td_registers(measurements, &report, own_log.then_some(&replays[..])),
-            Err(e) => println!("
-NOTE: failed to read the TDREPORT from {TDX_GUEST_DEVICE}: {e:#}"),
+            Ok(report) => {
+                failures.extend(compare_td_registers(measurements, &report, own_log.then_some(&replays[..])));
+                td_checked = true;
+            }
+            Err(e) => println!("\nNOTE: failed to read the TDREPORT from {TDX_GUEST_DEVICE}: {e:#}"),
         }
     }
-    Ok(())
+
+    println!("\n=== RESULT ===");
+    if failures.is_empty() {
+        if td_checked {
+            println!("SUCCESS: MRTD, RTMR0, RTMR1 and RTMR2 computed by tdx-measure match the running TD and its event log");
+        } else {
+            println!("SUCCESS: RTMR0, RTMR1 and RTMR2 computed by tdx-measure match the event log");
+            println!("(MRTD is not in the event log; run inside the TD with {TDX_GUEST_DEVICE} to check it)");
+        }
+    } else {
+        println!("FAILURE: {} mismatch(es):", failures.len());
+        for f in &failures {
+            println!("  - {f}");
+        }
+    }
+    Ok(failures.is_empty())
+}
+
+/// Hex dump in the style of common TDX event log dumpers.
+fn hex_dump(base: usize, data: &[u8]) {
+    for (i, chunk) in data.chunks(16).enumerate() {
+        let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02X}")).collect();
+        let ascii: String = chunk.iter()
+            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .collect();
+        println!("{:08X}  {:<47}  {}", base + i * 16, hex.join(" "), ascii);
+    }
+}
+
+fn dump_event(e: &Event) {
+    println!("\n---- event log entry #{} [{:#010x}] (not computed by tdx-measure) ----", e.index, e.offset);
+    if let Some(rtmr) = e.rtmr() {
+        println!("RTMR   : {rtmr}");
+    }
+    println!("Type   : {:#x} ({})", e.event_type, eventlog::event_type_name(e.event_type));
+    println!("Digest : {}", e.sha384.as_deref().map(hex::encode).unwrap_or_default());
+    println!("Event  : {}", e.describe());
+    println!("RAW DATA ({} bytes):", e.raw.len());
+    hex_dump(e.offset, &e.raw);
 }
 
 const TDX_GUEST_DEVICE: &str = "/dev/tdx_guest";
@@ -144,17 +202,22 @@ fn td_register(report: &[u8], offset: usize) -> &[u8] {
 
 /// Compare the computed measurements (and, for the TD's own event log, the
 /// log replay) with the registers in the running TD's TDREPORT.
-fn compare_td_registers(m: &TdxMeasurements, report: &[u8], replays: Option<&[Vec<u8>]>) {
+fn compare_td_registers(m: &TdxMeasurements, report: &[u8], replays: Option<&[Vec<u8>]>) -> Vec<String> {
     println!("\n=== Running TD registers (TDREPORT from {TDX_GUEST_DEVICE}) ===");
+    let mut failures = Vec::new();
     let verdict = |ok: bool| if ok { "MATCH" } else { "MISMATCH" };
     let mrtd = td_register(report, TDREPORT_MRTD);
     println!("MRTD : {} (TD {}, computed {})", verdict(mrtd == m.mrtd), hex::encode(mrtd), hex::encode(&m.mrtd));
     if mrtd != m.mrtd.as_slice() {
         println!("  -> qemu_options.bios is not the firmware this TD was launched with");
+        failures.push("MRTD differs from the TD: qemu_options.bios is not the firmware this TD was launched with".to_string());
     }
     for (i, computed) in [&m.rtmr0, &m.rtmr1, &m.rtmr2].into_iter().enumerate() {
         let td = td_register(report, TDREPORT_RTMR0 + i * 48);
         println!("RTMR{i}: {} (TD {}, computed {})", verdict(td == computed.as_slice()), hex::encode(td), hex::encode(computed));
+        if td != computed.as_slice() {
+            failures.push(format!("RTMR{i} differs from the TD register"));
+        }
         if let Some(replay) = replays.map(|r| r[i].as_slice()) {
             if replay != td {
                 println!(
@@ -168,6 +231,7 @@ fn compare_td_registers(m: &TdxMeasurements, report: &[u8], replays: Option<&[Ve
         }
     }
     println!("RTMR3: TD {} (not computed by tdx-measure)", hex::encode(td_register(report, TDREPORT_RTMR0 + 3 * 48)));
+    failures
 }
 
 fn explain_gpt(machine: &Machine, e: &Event) {

@@ -130,7 +130,9 @@ fn run_measure(args: &MeasureArgs) -> Result<()> {
     output_measurements(args, &measurements)?;
 
     if let Some(ref ccel) = args.compare_eventlog {
-        eventlog_compare::compare_eventlog(&machine, &measurements, ccel)?;
+        if !eventlog_compare::compare_eventlog(&machine, &measurements, ccel)? {
+            std::process::exit(1);
+        }
     }
 
     Ok(())
