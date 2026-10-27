@@ -79,6 +79,7 @@ fn machine_from_grouped(g: &Grouped, boot_mode: &str, tdvf_before_202411: bool) 
         tdvf_before_202411,
         secure_boot: None,
         shim_fallback: None,
+        td_hob_mmio: false,
         boot_current: opt(indirect, "[Path to BootCurrent.bin]"),
         acpi_tables_bin: Some("[Path to acpi_tables_bin]".to_string()),
         rsdp: opt(indirect, "[Path to rsdp]"),

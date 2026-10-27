@@ -125,6 +125,11 @@ pub struct MeasureConfig {
     /// from the presence of `/boot/efi/NvVars` in `qcow2` (host).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shim_fallback: Option<bool>,
+    /// True if the VMM appends MMIO resource descriptors (32-bit PCI hole up
+    /// to the APIC and the 64-bit PCI hole) to the TD HOB, as older
+    /// downstream TDX QEMU builds do. Defaults to false (upstream QEMU).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub td_hob_mmio: bool,
     /// Path to the captured `BootCurrent` variable (in-guest measurement).
     #[serde(default, skip_serializing_if = "is_none_or_empty")]
     pub boot_current: Option<String>,

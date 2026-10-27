@@ -325,7 +325,8 @@ impl<'a> Tdvf<'a> {
     pub fn rtmr0_log(&self, machine: &Machine, shim_fallback: bool) -> Result<Vec<Vec<u8>>> {
         // Calculate measurement of the TD Hand-Off Block (TD-HOB)
         let memory_size = machine.memory_size()?;
-        let td_hob_hash = self.measure_td_hob(memory_size)?;
+        let td_hob_mmio = machine.measure_config.as_ref().is_some_and(|mc| mc.td_hob_mmio);
+        let td_hob_hash = self.measure_td_hob(memory_size, td_hob_mmio)?;
 
         // Calculate measurement of the Configuration Firmware Volume (CFV)
         let cfv_hash = self.measure_cfv().context("Failed to find CFV section")?;
@@ -406,7 +407,7 @@ impl<'a> Tdvf<'a> {
         Ok(rtmr0_log)
     }
 
-    fn measure_td_hob(&self, memory_size: u64) -> Result<Vec<u8>> {
+    fn measure_td_hob(&self, memory_size: u64, mmio: bool) -> Result<Vec<u8>> {
         let mut memory_acceptor = MemoryAcceptor::new(0, memory_size);
         let mut td_hob = Vec::new();
 
@@ -431,17 +432,19 @@ impl<'a> Tdvf<'a> {
         td_hob.extend_from_slice(&[0u8; 8]); // EfiFreeMemoryBottom
         td_hob.extend_from_slice(&[0u8; 8]); // EfiEndOfHobList (placeholder)
 
-        let mut add_memory_resource_hob = |resource_type: u8, start: u64, length: u64| {
+        let mut add_resource_hob = |resource_type: u8, attribute: u32, start: u64, length: u64| {
             td_hob.extend_from_slice(&[0x03, 0x00]); // HobType
             td_hob.extend_from_slice(&48u16.to_le_bytes()); // HobLength
             td_hob.extend_from_slice(&[0u8; 4]); // Reserved
             td_hob.extend_from_slice(&[0u8; 16]); // Owner
             td_hob.extend_from_slice(&resource_type.to_le_bytes());
             td_hob.extend_from_slice(&[0u8; 3]); // Padding for resource type
-            td_hob.extend_from_slice(&7u32.to_le_bytes()); // ResourceAttribute
+            td_hob.extend_from_slice(&attribute.to_le_bytes()); // ResourceAttribute
             td_hob.extend_from_slice(&start.to_le_bytes());
             td_hob.extend_from_slice(&length.to_le_bytes());
         };
+        let mut add_memory_resource_hob =
+            |resource_type: u8, start: u64, length: u64| add_resource_hob(resource_type, 7, start, length);
 
         let (_, last_start, last_end) = memory_acceptor.ranges.pop().expect("No ranges");
 
@@ -458,6 +461,17 @@ impl<'a> Tdvf<'a> {
             add_memory_resource_hob(0x07, 0x100000000, last_end - 0x80000000u64);
         } else {
             add_memory_resource_hob(0x07, last_start, last_end - last_start);
+        }
+
+        if mmio {
+            const GIB: u64 = 1 << 30;
+            const APIC_DEFAULT_ADDRESS: u64 = 0xFEE0_0000;
+            const PCI_HOLE64_SIZE: u64 = 32 * GIB; // q35 default
+            const MMIO_ATTRIBUTE: u32 = 0x403; // PRESENT | INITIALIZED | UNCACHEABLE
+            let below_4g = if memory_size >= 0xB0000000 { 0x80000000 } else { memory_size };
+            let hole64_start = (0x100000000 + memory_size - below_4g).div_ceil(GIB) * GIB;
+            add_resource_hob(0x01, MMIO_ATTRIBUTE, below_4g, APIC_DEFAULT_ADDRESS - below_4g);
+            add_resource_hob(0x01, MMIO_ATTRIBUTE, hole64_start, PCI_HOLE64_SIZE);
         }
 
         let end_of_hob_list = td_hob_base_addr + td_hob.len() as u64 + 8;
@@ -528,6 +542,32 @@ impl MemoryAcceptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn td_hob_with_mmio_resources() {
+        // TdxTable digests from a TD event log (16G, Ubuntu OVMF layout) of a
+        // VMM that appends MMIO resource HOBs, and the upstream QEMU layout.
+        let section = |memory_address, memory_data_size, sec_type| TdvfSection {
+            data_offset: 0, raw_data_size: 0, memory_address, memory_data_size, sec_type, attributes: 0,
+        };
+        let tdvf = Tdvf {
+            fw: &[],
+            sections: vec![
+                section(0x800000, 0x6000, TDVF_SECTION_TEMP_MEM),
+                section(0x809000, 0x2000, TDVF_SECTION_TD_HOB),
+                section(0x80b000, 0x2000, TDVF_SECTION_TEMP_MEM),
+                section(0x810000, 0x10000, TDVF_SECTION_TEMP_MEM),
+            ],
+        };
+        assert_eq!(
+            hex::encode(tdvf.measure_td_hob(16 << 30, true).unwrap()),
+            "18a0a0201e013689dc6d05735ff9c0a063282af439ce31e4afa84acc6eb014089903a798339ed342fd9cf08d06a848d0"
+        );
+        assert_eq!(
+            hex::encode(tdvf.measure_td_hob(16 << 30, false).unwrap()),
+            "cd2312a0d87ef3c4a928df87088969a80b33d7bf3fc584bdde637b09ed808a8d821a56b78a13a6eb506db7578444abbe"
+        );
+    }
 
     #[test]
     fn secure_boot_disabled_is_measured_as_one_byte() {
