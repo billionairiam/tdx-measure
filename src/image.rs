@@ -94,7 +94,7 @@ pub enum ImageSource<'a> {
 
 impl ImageSource<'_> {
     /// Read a file from the guest filesystem (absolute guest path).
-    fn read_file(&self, guest_path: &str) -> Result<Vec<u8>> {
+    pub(crate) fn read_file(&self, guest_path: &str) -> Result<Vec<u8>> {
         match self {
             ImageSource::Qcow2(qcow2) => guestfish_download(qcow2, guest_path),
             ImageSource::Local { rootfs, .. } => {

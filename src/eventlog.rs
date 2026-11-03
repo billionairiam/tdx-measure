@@ -15,6 +15,8 @@ pub const EV_EFI_BOOT_SERVICES_APPLICATION: u32 = 0x8000_0003;
 pub const EV_EFI_GPT_EVENT: u32 = 0x8000_0006;
 /// Tagged event id the Linux EFI stub uses when measuring the initrd.
 pub const LINUX_INITRD_TAG: u32 = 0x8F3B_22EC;
+/// Tagged event id the Linux EFI stub uses when measuring `LoadOptions`.
+pub const LINUX_LOAD_OPTIONS_TAG: u32 = 0x8F3B_22ED;
 
 const TPM_ALG_SHA384: u16 = 0x0C;
 

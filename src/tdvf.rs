@@ -131,7 +131,7 @@ fn parse_boot_order(machine: &Machine, shim_fallback: bool) -> Result<(Vec<u8>, 
 
             Ok((boot_order_data, boot_entries))
         } else {
-            Err(anyhow!("Boot order file is required for indirect boot"))
+            Err(anyhow!("Boot order file is required for indirect and UKI boot"))
         }
     }
 }
@@ -394,9 +394,9 @@ impl<'a> Tdvf<'a> {
             rtmr0_log.push(measure_sha384(&[0x00, 0x00, 0x00, 0x00])); // Separator
         }
 
-        // Add SbatLevel if not direct boot; shim measures it on every run, and
+        // Add SbatLevel for indirect boot; shim measures it on every run, and
         // with fallback shim runs twice (BOOTX64.EFI, then shimx64.efi).
-        if !machine.is_direct_boot() {
+        if !machine.is_direct_boot() && !machine.is_uki_boot() {
             let shim_runs = if shim_fallback { 2 } else { 1 };
             for _ in 0..shim_runs {
                 rtmr0_log.push(measure_tdx_efi_variable("605DAB50-E046-4300-ABB6-3DD810DD8B23", "SbatLevel", Some(b"sbat,1,2021030218\n"))?);

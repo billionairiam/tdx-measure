@@ -34,7 +34,17 @@ pub fn generate_transcript(output_file: &Path, machine: &Machine, platform_only:
     if !platform_only {
         // Display command line
         writeln!(output, "=== Kernel Command Line ===").unwrap();
-        writeln!(output, "{}", machine.cmdline()).unwrap();
+        if machine.is_uki_boot() {
+            match machine.uki_boot() {
+                Ok(uki) => {
+                    writeln!(output, "{}", uki.cmdline.unwrap_or_default()).unwrap();
+                    writeln!(output, "(systemd-stub {})", uki.stub_version.as_deref().unwrap_or("unknown")).unwrap();
+                }
+                Err(e) => writeln!(output, "Failed to read the UKI command line: {e:#}").unwrap(),
+            }
+        } else {
+            writeln!(output, "{}", machine.cmdline()).unwrap();
+        }
         writeln!(output).unwrap();
 
         // Display MOK variables and SBAT level for indirect boot

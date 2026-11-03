@@ -63,7 +63,7 @@ enum Commands {
         #[arg(long)]
         qemu_command: PathBuf,
         /// Boot mode for the generated metadata.
-        #[arg(long, value_parser = ["direct", "indirect"])]
+        #[arg(long, value_parser = ["direct", "indirect", "uki"])]
         boot_mode: String,
         /// Mark the TDVF firmware as the 202411 build or newer (omits the trailing RTMR0 separator).
         #[arg(long)]
@@ -73,7 +73,7 @@ enum Commands {
         output: PathBuf,
         /// Run inside the TD: point `measure_config` at the files written by
         /// extract_config_files.py (see --dir) and take the kernel cmdline and
-        /// boot disk from the running guest. Requires --boot-mode indirect.
+        /// boot disk from the running guest. Requires --boot-mode indirect or uki.
         #[arg(long)]
         in_guest: bool,
         /// Directory with the extract_config_files.py output.

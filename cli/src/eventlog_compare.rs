@@ -8,8 +8,10 @@ use anyhow::{Context, Result};
 use fs_err as fs;
 use sha2::{Digest, Sha384};
 use std::path::Path;
-use tdx_measure::eventlog::{self, Event, EV_EFI_BOOT_SERVICES_APPLICATION, EV_EFI_GPT_EVENT, LINUX_INITRD_TAG};
-use tdx_measure::{describe_gpt_event_data, Machine, TdxMeasurements};
+use tdx_measure::eventlog::{
+    self, Event, EV_EFI_BOOT_SERVICES_APPLICATION, EV_EFI_GPT_EVENT, LINUX_INITRD_TAG, LINUX_LOAD_OPTIONS_TAG,
+};
+use tdx_measure::{describe_gpt_event_data, uki, Machine, TdxMeasurements};
 
 pub const DEFAULT_CCEL: &str = "/sys/firmware/acpi/tables/data/CCEL";
 
@@ -107,10 +109,18 @@ pub fn compare_eventlog(machine: &Machine, measurements: &TdxMeasurements, ccel:
     if !unmatched.is_empty() || !computed_only.is_empty() {
         println!("\n=== Mismatch details ===");
     }
+    let uki_boot = machine.is_uki_boot();
+    let mut uki_explained = false;
     for e in &unmatched {
         dump_event(e);
         if e.event_type == EV_EFI_GPT_EVENT {
             explain_gpt(machine, e);
+        } else if uki_boot && e.tag_id() == Some(LINUX_LOAD_OPTIONS_TAG) {
+            explain_uki_cmdline(machine, e);
+        } else if uki_boot && (e.event_type == EV_EFI_BOOT_SERVICES_APPLICATION
+            || e.tag_id() == Some(LINUX_INITRD_TAG) && !matches!(machine.initrd_path(), Ok(Some(_))))
+        {
+            explain_uki(machine, e, !std::mem::replace(&mut uki_explained, true));
         } else if e.tag_id() == Some(LINUX_INITRD_TAG) {
             explain_initrd(machine, e);
         }
@@ -235,6 +245,87 @@ fn compare_td_registers(m: &TdxMeasurements, report: &[u8], replays: Option<&[Ve
     failures
 }
 
+/// Report whether `path` changed after this boot, when it was measured.
+fn print_mtime(path: &Path, regenerated_by: &str) {
+    let boot_time = fs::read_to_string("/proc/stat").ok().and_then(|s| {
+        s.lines().find_map(|l| l.strip_prefix("btime ").and_then(|v| v.trim().parse::<i64>().ok()))
+    });
+    let mtime = path.metadata().ok().and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
+    if let (Some(boot), Some(m)) = (boot_time, mtime) {
+        if m > boot {
+            println!("{} was modified {}s AFTER this boot started: it was regenerated (e.g. {regenerated_by}) \
+                      after it was measured at boot; reboot and measure again", path.display(), m - boot);
+        } else {
+            println!("{} was last modified {}s before this boot", path.display(), boot - m);
+        }
+    }
+}
+
+/// A UKI, its kernel or its initrd differs: check whether the UKI changed.
+fn explain_uki(machine: &Machine, e: &Event, inspect_file: bool) {
+    println!("\n--- UKI mismatch (event #{}) ---", e.index);
+    if e.event_type == EV_EFI_BOOT_SERVICES_APPLICATION && e.data.len() >= 16 {
+        let len = u64::from_le_bytes(e.data[8..16].try_into().unwrap());
+        println!("Firmware loaded a {len:#x} ({len}) byte image");
+    }
+    if !inspect_file {
+        return;
+    }
+    let guest = machine.uki_guest_path();
+    match machine.uki_path() {
+        Ok(Some(path)) => match path.metadata() {
+            Ok(m) => {
+                println!("{}: {:#x} ({}) bytes; tdx-measure measured this UKI", path.display(), m.len(), m.len());
+                print_mtime(&path, "ukify or kernel-install");
+            }
+            Err(err) => println!("Failed to read {}: {err}", path.display()),
+        },
+        Ok(None) => println!("{guest} is in the qcow2 image; cannot inspect it further"),
+        Err(err) => println!("Failed to locate {guest}: {err:#}"),
+    }
+    println!("If firmware booted another UKI (see the device path above), set measure_config.uki to it");
+}
+
+/// The kernel command line differs: show which candidate the event log measured.
+fn explain_uki_cmdline(machine: &Machine, e: &Event) {
+    println!("\n--- kernel command line mismatch (event #{}) ---", e.index);
+    let expected = e.sha384.as_deref().map(hex::encode).unwrap_or_default();
+    println!("Event log LoadOptions SHA384: {expected}");
+    let source = if machine.measure_config.as_ref().is_some_and(|mc| mc.cmdline.is_some()) {
+        "measure_config.cmdline"
+    } else {
+        "UKI .cmdline"
+    };
+    let mut candidates = Vec::new();
+    let mut major = None;
+    match machine.uki_boot() {
+        Ok(uki) => {
+            println!("systemd-stub version (.sdmagic): {}", uki.stub_version.as_deref().unwrap_or("unknown"));
+            major = uki.stub_version.as_deref().and_then(uki::stub_major);
+            match uki.cmdline {
+                Some(c) => candidates.push((source, c)),
+                None => println!("The UKI has no .cmdline section"),
+            }
+        }
+        Err(err) => println!("Failed to read the UKI command line: {err:#}"),
+    }
+    if let Ok(c) = fs::read_to_string("/proc/cmdline") {
+        candidates.push(("/proc/cmdline", uki::stub_cmdline(c.as_bytes(), major)));
+    }
+    for (source, cmdline) in &candidates {
+        println!("{source}: {cmdline:?}");
+        let with_nul = uki::load_options(cmdline);
+        for (variant, data) in [("with NUL", &with_nul[..]), ("without NUL", &with_nul[..with_nul.len() - 2])] {
+            let digest = hex::encode(Sha384::digest(data));
+            let verdict = if digest == expected { "  <-- MATCHES the event log" } else { "" };
+            println!("  UTF-16 {variant}: {digest}{verdict}");
+        }
+    }
+    println!("Set measure_config.cmdline to the matching command line to override the UKI's .cmdline");
+}
+
 fn explain_gpt(machine: &Machine, e: &Event) {
     println!("\n--- GPT mismatch (event #{}) ---", e.index);
     println!("The firmware measured the GPT below at boot; tdx-measure read the current disk.");
@@ -274,25 +365,11 @@ fn explain_initrd(machine: &Machine, e: &Event) {
             return;
         }
     };
-    let boot_time = fs::read_to_string("/proc/stat").ok().and_then(|s| {
-        s.lines().find_map(|l| l.strip_prefix("btime ").and_then(|v| v.trim().parse::<i64>().ok()))
-    });
-    let mtime = |p: &Path| {
-        p.metadata().ok()?.modified().ok()?
-            .duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
-    };
     match fs::read(&path) {
         Ok(data) => println!("{}: SHA384 {}", path.display(), hex::encode(Sha384::digest(&data))),
         Err(err) => println!("{err:#}"),
     }
-    if let (Some(boot), Some(m)) = (boot_time, mtime(&path)) {
-        if m > boot {
-            println!("{} was modified {}s AFTER this boot started: it was regenerated (e.g. update-initramfs) \
-                      after the firmware measured it; reboot and measure again", path.display(), m - boot);
-        } else {
-            println!("{} was last modified {}s before this boot", path.display(), boot - m);
-        }
-    }
+    print_mtime(&path, "update-initramfs");
     // Look for another initrd that matches the measured one.
     let dir = path.parent().unwrap_or(Path::new("/boot"));
     if let Ok(entries) = fs::read_dir(dir) {

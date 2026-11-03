@@ -73,6 +73,9 @@ fn machine_from_grouped(g: &Grouped, boot_mode: &str, tdvf_before_202411: bool) 
     };
 
     let indirect = boot_mode == "indirect";
+    let uki = boot_mode == "uki";
+    // Both boot from the guest disk with firmware's real boot variables.
+    let disk_boot = indirect || uki;
     let opt = |on: bool, v: &str| on.then(|| v.to_string());
     let measure_config = MeasureConfig {
         bootmode: boot_mode.to_string(),
@@ -82,14 +85,16 @@ fn machine_from_grouped(g: &Grouped, boot_mode: &str, tdvf_before_202411: bool) 
         td_hob_mmio: false,
         boot_current: opt(indirect, "[Path to BootCurrent.bin]"),
         acpi_tables_bin: Some("[Path to acpi_tables_bin]".to_string()),
-        rsdp: opt(indirect, "[Path to rsdp]"),
-        table_loader: opt(indirect, "[Path to table_loader]"),
-        boot_order: opt(indirect, "[Path to BootOrder.bin]"),
-        path_boot_xxxx: opt(indirect, "[Path to Bootxxx.bin dir]"),
+        rsdp: opt(disk_boot, "[Path to rsdp]"),
+        table_loader: opt(disk_boot, "[Path to table_loader]"),
+        boot_order: opt(disk_boot, "[Path to BootOrder.bin]"),
+        path_boot_xxxx: opt(disk_boot, "[Path to Bootxxx.bin dir]"),
         kernel: None,
         initrd: None,
+        // UKI boot takes the command line from the UKI's .cmdline section.
         cmdline: opt(indirect, "cmdline"),
-        qcow2: opt(indirect, "[Path to qcow2 image]"),
+        uki: opt(uki, tdx_measure::uki::DEFAULT_UKI_PATH),
+        qcow2: opt(disk_boot, "[Path to qcow2 image]"),
         disk: None,
         rootfs: None,
         mok_list: opt(indirect, "[Path to mok_list]"),
@@ -145,8 +150,8 @@ fn run_with(
     }
     let mut machine = machine_from_grouped(&grouped, boot_mode, tdvf_before_202411);
     if let Some(opts) = in_guest {
-        if boot_mode != "indirect" {
-            bail!("--in-guest requires --boot-mode indirect");
+        if boot_mode == "direct" {
+            bail!("--in-guest requires --boot-mode indirect or uki");
         }
         let mc = machine.measure_config.as_mut().expect("measure_config is always set");
         fill_from_guest(mc, opts, sources)?;
@@ -209,12 +214,15 @@ fn fill_from_guest(mc: &mut MeasureConfig, opts: &GuestOptions, src: &GuestSourc
     file(&mut mc.rsdp, "rsdp.bin", false);
     file(&mut mc.table_loader, "table_loader.bin", false);
     file(&mut mc.boot_order, "BootOrder.bin", false);
-    // Required to tell whether this boot went through shim's fallback path.
-    file(&mut mc.boot_current, "BootCurrent.bin", false);
-    file(&mut mc.mok_list, "MokListRT.bin", true);
-    file(&mut mc.mok_list_trusted, "MokListTrustedRT.bin", true);
-    file(&mut mc.mok_list_x, "MokListXRT.bin", true);
-    file(&mut mc.sbat_level, "SbatLevelRT.bin", true);
+    // UKI boot has no shim: no fallback path and no MOK/SBAT variables.
+    if !mc.is_uki_boot() {
+        // Required to tell whether this boot went through shim's fallback path.
+        file(&mut mc.boot_current, "BootCurrent.bin", false);
+        file(&mut mc.mok_list, "MokListRT.bin", true);
+        file(&mut mc.mok_list_trusted, "MokListTrustedRT.bin", true);
+        file(&mut mc.mok_list_x, "MokListXRT.bin", true);
+        file(&mut mc.sbat_level, "SbatLevelRT.bin", true);
+    }
     if !missing.is_empty() {
         eprintln!(
             "warning: missing extracted files (run extract_config_files.py in {} first): {}",
@@ -224,7 +232,9 @@ fn fill_from_guest(mc: &mut MeasureConfig, opts: &GuestOptions, src: &GuestSourc
     }
     mc.path_boot_xxxx = Some(dir.to_string_lossy().into_owned());
 
-    mc.cmdline = Some(fs::read_to_string(src.proc.join("cmdline"))?.trim().to_string());
+    if !mc.is_uki_boot() {
+        mc.cmdline = Some(fs::read_to_string(src.proc.join("cmdline"))?.trim().to_string());
+    }
     let disk = match opts.disk.clone().or_else(|| detect_boot_disk(src)) {
         Some(disk) => disk,
         None => bail!("could not find the disk backing /boot/efi; pass --disk"),
@@ -321,6 +331,16 @@ mod tests {
         run_with(&root.join("command"), "indirect", true, &meta, Some(&opts), &sources).unwrap();
         let machine: Machine = serde_json::from_str(&fs::read_to_string(&meta).unwrap()).unwrap();
         assert_eq!(machine.measure_config.unwrap().boot_current.as_deref(), Some("[Path to BootCurrent.bin]"));
+
+        // UKI boot: no shim, so no BootCurrent/MOK/SBAT; the cmdline comes from the UKI.
+        run_with(&root.join("command"), "uki", true, &meta, Some(&opts), &sources).unwrap();
+        let machine: Machine = serde_json::from_str(&fs::read_to_string(&meta).unwrap()).unwrap();
+        let mc = machine.measure_config.unwrap();
+        assert_eq!(mc.bootmode, "uki");
+        assert_eq!(mc.uki.as_deref(), Some("/boot/efi/EFI/BOOT/BOOTX64.EFI"));
+        assert_eq!(mc.boot_order, file("BootOrder.bin"));
+        assert_eq!((mc.boot_current, mc.mok_list, mc.cmdline), (None, None, None));
+        assert_eq!(mc.disk.as_deref(), Some("/dev/vda"));
 
         let err = run_with(&root.join("command"), "direct", true, &meta, Some(&opts), &sources).unwrap_err();
         assert!(err.to_string().contains("indirect"));

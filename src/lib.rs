@@ -21,6 +21,7 @@ mod machine;
 mod num;
 mod secure_boot;
 mod tdvf;
+pub mod uki;
 mod util;
 
 /// Contains all the measurement values for TDX.
@@ -103,8 +104,8 @@ impl QemuOptions {
 }
 
 /// Measurement-specific configuration.
-/// Contains `bootmode` to distinguish direct vs indirect boot,
-/// plus all inputs needed for measurement computation.
+/// Contains `bootmode` (`direct`, `indirect` or `uki`) to select the boot
+/// chain, plus all inputs needed for measurement computation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeasureConfig {
     pub bootmode: String,
@@ -147,11 +148,17 @@ pub struct MeasureConfig {
     // Direct boot fields
     #[serde(skip_serializing_if = "is_none_or_empty")]
     pub kernel: Option<String>,
+    /// Direct boot: the initrd. UKI boot: overrides the UKI's `.initrd`.
     #[serde(skip_serializing_if = "is_none_or_empty")]
     pub initrd: Option<String>,
+    /// UKI boot: overrides the UKI's `.cmdline`.
     #[serde(skip_serializing_if = "is_none_or_empty")]
     pub cmdline: Option<String>,
-    // Indirect boot fields
+    /// UKI boot: guest path of the unified kernel image firmware boots
+    /// (defaults to `/boot/efi/EFI/BOOT/BOOTX64.EFI`).
+    #[serde(default, skip_serializing_if = "is_none_or_empty")]
+    pub uki: Option<String>,
+    // Indirect and UKI boot fields
     #[serde(skip_serializing_if = "is_none_or_empty")]
     pub qcow2: Option<String>,
     /// Raw boot disk (e.g. `/dev/vda`) used instead of `qcow2` when measuring
@@ -174,6 +181,10 @@ pub struct MeasureConfig {
 impl MeasureConfig {
     pub fn is_direct_boot(&self) -> bool {
         self.bootmode == "direct"
+    }
+
+    pub fn is_uki_boot(&self) -> bool {
+        self.bootmode == "uki"
     }
 }
 

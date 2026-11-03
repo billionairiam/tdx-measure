@@ -78,6 +78,7 @@ fn machine_for(fixture: &Path) -> Machine {
             kernel: Some("/dev/null".into()),
             initrd: Some("/dev/null".into()),
             cmdline: None,
+            uki: None,
             qcow2: None,
             disk: None,
             rootfs: None,

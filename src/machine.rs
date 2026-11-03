@@ -5,7 +5,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use crate::tdvf::{load_boot_variable_if_exists, load_option_has_file_path, Tdvf};
-use crate::{kernel, image, measure_log, parse_memory_size, TdxMeasurements, QemuOptions, MeasureConfig};
+use crate::{kernel, image, uki, measure_log, parse_memory_size, TdxMeasurements, QemuOptions, MeasureConfig};
 use anyhow::{Context, Result, anyhow};
 use fs_err as fs;
 use log::debug;
@@ -67,8 +67,8 @@ impl Machine {
     pub fn validate(&self) -> Result<()> {
         if let Some(mc) = &self.measure_config {
             match mc.bootmode.as_str() {
-                "direct" | "indirect" => Ok(()),
-                other => Err(anyhow!("Invalid bootmode: '{}'. Must be 'direct' or 'indirect'", other)),
+                "direct" | "indirect" | "uki" => Ok(()),
+                other => Err(anyhow!("Invalid bootmode: '{}'. Must be 'direct', 'indirect' or 'uki'", other)),
             }
         } else {
             Ok(())
@@ -80,6 +80,11 @@ impl Machine {
         self.measure_config.as_ref()
             .map(|mc| mc.is_direct_boot())
             .unwrap_or(true)
+    }
+
+    /// Whether this is UKI boot mode.
+    pub fn is_uki_boot(&self) -> bool {
+        self.measure_config.as_ref().is_some_and(|mc| mc.is_uki_boot())
     }
 
     /// Get command line.
@@ -148,22 +153,22 @@ impl Machine {
         self.compute_rtmr1_rtmr2(0xb0000000, shim_fallback)
     }
 
-    /// Where the indirect-boot chain is read from: `qcow2` (host) or `disk` (in-guest).
+    /// Where the indirect/UKI boot chain is read from: `qcow2` (host) or `disk` (in-guest).
     fn image_source(&self) -> Result<image::ImageSource<'_>> {
         let mc = self.measure_config.as_ref()
             .ok_or_else(|| anyhow!("measure_config is required for runtime measurement"))?;
         match (mc.qcow2.as_deref(), mc.disk.as_deref()) {
-            (Some(_), Some(_)) => Err(anyhow!("qcow2 and disk are mutually exclusive for indirect boot")),
+            (Some(_), Some(_)) => Err(anyhow!("qcow2 and disk are mutually exclusive")),
             (Some(qcow2), None) => Ok(image::ImageSource::Qcow2(qcow2)),
             (None, Some(disk)) => Ok(image::ImageSource::Local {
                 disk,
                 rootfs: mc.rootfs.as_deref().unwrap_or("/"),
             }),
-            (None, None) => Err(anyhow!("indirect boot requires either qcow2 (host) or disk (in-guest)")),
+            (None, None) => Err(anyhow!("{} boot requires either qcow2 (host) or disk (in-guest)", mc.bootmode)),
         }
     }
 
-    /// The EV_EFI_GPT_EVENT data (EFI_GPT_DATA) measured into RTMR1 for indirect boot.
+    /// The EV_EFI_GPT_EVENT data (EFI_GPT_DATA) measured into RTMR1 for indirect/UKI boot.
     pub fn gpt_event_data(&self) -> Result<Vec<u8>> {
         image::extract_gpt_event_data(&self.image_source()?)
     }
@@ -178,7 +183,7 @@ impl Machine {
         let Some(mc) = self.measure_config.as_ref() else {
             return Ok(false);
         };
-        if mc.is_direct_boot() {
+        if mc.is_direct_boot() || mc.is_uki_boot() {
             return Ok(false);
         }
         if let Some(fallback) = mc.shim_fallback {
@@ -228,7 +233,8 @@ impl Machine {
     pub fn initrd_path(&self) -> Result<Option<PathBuf>> {
         let mc = self.measure_config.as_ref()
             .ok_or_else(|| anyhow!("measure_config is required"))?;
-        if mc.is_direct_boot() {
+        if mc.is_direct_boot() || mc.is_uki_boot() {
+            // UKI boot without an override measures the UKI's `.initrd`.
             return Ok(mc.initrd.as_ref().map(PathBuf::from));
         }
         match self.image_source()? {
@@ -238,6 +244,39 @@ impl Machine {
             }
             image::ImageSource::Qcow2(_) => Ok(None),
         }
+    }
+
+    /// Guest path of the UKI booted in UKI boot mode.
+    pub fn uki_guest_path(&self) -> &str {
+        self.measure_config.as_ref()
+            .and_then(|mc| mc.uki.as_deref())
+            .unwrap_or(uki::DEFAULT_UKI_PATH)
+    }
+
+    /// Local path of the UKI, if it is a local file (in-guest).
+    pub fn uki_path(&self) -> Result<Option<PathBuf>> {
+        match self.image_source()? {
+            image::ImageSource::Local { rootfs, .. } => {
+                Ok(Some(Path::new(rootfs).join(self.uki_guest_path().trim_start_matches('/'))))
+            }
+            image::ImageSource::Qcow2(_) => Ok(None),
+        }
+    }
+
+    /// The UKI inputs (stub version, kernel command line, initrd) in UKI boot mode.
+    pub fn uki_boot(&self) -> Result<uki::UkiBoot> {
+        let mc = self.measure_config.as_ref()
+            .ok_or_else(|| anyhow!("measure_config is required"))?;
+        self.load_uki(mc)
+    }
+
+    fn load_uki(&self, mc: &MeasureConfig) -> Result<uki::UkiBoot> {
+        uki::UkiBoot::load(
+            &self.image_source()?,
+            self.uki_guest_path(),
+            mc.cmdline.as_deref(),
+            mc.initrd.as_deref(),
+        )
     }
 
     fn rtmr1_rtmr2_logs(&self, memory_size: u64, shim_fallback: bool) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
@@ -256,6 +295,8 @@ impl Machine {
             let rtmr1 = kernel::rtmr1_log_direct(kernel_path, initrd_path, memory_size, 0x28000, rtmr1_separator)?;
             let rtmr2 = kernel::rtmr2_log_direct(initrd_path, cmdline)?;
             Ok((rtmr1, rtmr2))
+        } else if mc.is_uki_boot() {
+            uki::rtmr1_rtmr2_logs(&self.image_source()?, &self.load_uki(mc)?, rtmr1_separator)
         } else {
             let source = self.image_source()?;
             let mok_list = mc.mok_list.as_deref();

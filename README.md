@@ -50,7 +50,7 @@ A log file path must be given with `=` (e.g. `--compare-eventlog=CCEL.bin`).
 Running with `RUST_LOG=debug` additionally dumps the raw GPT event data computed
 from the disk.
 
-The boot mode (`direct` vs `indirect`) is determined by the `bootmode` field inside `measure_config` in the metadata file.
+The boot mode (`direct`, `indirect` or `uki`) is determined by the `bootmode` field inside `measure_config` in the metadata file.
 
 `measure` computes all four registers (MRTD, RTMR0–2) and therefore requires the
 runtime inputs (kernel/initrd or qcow2). It reads the ACPI tables from the
@@ -62,18 +62,22 @@ runtime inputs (kernel/initrd or qcow2). It reads the ACPI tables from the
 The `gen-metadata` subcommand parses a raw QEMU command line (via the bundled `qcparser` library) and emits a `metadata.json` skeleton:
 
 ```
-tdx-measure gen-metadata --qemu-command <FILE> --boot-mode <direct|indirect> [--tdvf-after-202411] [-o metadata.json]
+tdx-measure gen-metadata --qemu-command <FILE> --boot-mode <direct|indirect|uki> [--tdvf-after-202411] [-o metadata.json]
 ```
 
 `--qemu-command` points to a file containing the QEMU invocation: a shell command line, or a running QEMU's `/proc/PID/cmdline` copied as-is (`cp /proc/PID/cmdline FILE`) or one argument per line (`tr '\0' '\n'`). Don't copy `cat /proc/PID/cmdline` from a terminal: that drops the argument separators, and `gen-metadata` rejects such a file. `--boot-mode` selects the boot chain and seeds the matching `measure_config` placeholder paths. `--tdvf-after-202411` marks the firmware as the 202411 build or newer (otherwise older firmware is assumed). The parsed VM shape is written to `qemu_options`; fill in the placeholder measurement-input paths afterwards.
 
-Inside a running TD, `--in-guest` (indirect boot only) fills in `measure_config` instead of emitting placeholders: it points at the files written by [`extract_config_files.py`](extract_config_files.py) into `--dir` (default `.`), sets `cmdline` from `/proc/cmdline`, and sets `disk` to the disk backing `/boot/efi` (override with `--disk`; `--rootfs` defaults to `/`). `qemu_options` still comes from `--qemu-command`, so pass the QEMU command line the TD was launched with, then copy the host's OVMF image into the TD and point `qemu_options.bios` at it:
+Inside a running TD, `--in-guest` (indirect and UKI boot) fills in `measure_config` instead of emitting placeholders: it points at the files written by [`extract_config_files.py`](extract_config_files.py) into `--dir` (default `.`), sets `cmdline` from `/proc/cmdline`, and sets `disk` to the disk backing `/boot/efi` (override with `--disk`; `--rootfs` defaults to `/`). `qemu_options` still comes from `--qemu-command`, so pass the QEMU command line the TD was launched with, then copy the host's OVMF image into the TD and point `qemu_options.bios` at it:
 
 ```
 cd workdir && sudo python3 ../extract_config_files.py
 sudo tdx-measure gen-metadata --qemu-command command --boot-mode indirect --in-guest
 sudo tdx-measure metadata.json --compare-eventlog
 ```
+
+For UKI boot (`--boot-mode uki --in-guest`), `cmdline`, MOK and SbatLevel are not filled in: the command line comes from the UKI's `.cmdline` section, and no shim runs.
+
+`extract_config_files.py` reads the ACPI files from `/sys/firmware/qemu_fw_cfg`, which needs a guest kernel with `CONFIG_FW_CFG_SYSFS`; otherwise generate them with `gen-acpi` or dump them from another guest started with the same QEMU command line. To run `tdx-measure` in a guest whose glibc is older than the build host's, build a static binary with `cargo build --release -p cli --target x86_64-unknown-linux-musl`.
 
 ### Direct Boot
 
@@ -239,6 +243,21 @@ Create `metadata.json` file with the below metadata:
     Used to revoke specific bootloader versions without revoking their signing keys.
     The file can be extracted by running the [`extract_config_files.py`](extract_config_files.py) script inside a TD, which is configured identically to the target configuration.
 
+### UKI Boot
+
+With `"bootmode": "uki"`, firmware boots a [Unified Kernel Image](https://uapi-group.org/specifications/specs/unified_kernel_image/) (a systemd-stub PE binary with `.linux`, `.initrd` and `.cmdline` sections) directly from the ESP, without shim or grub. `measure_config` takes the indirect-boot RTMR[0] fields (`acpi_tables_bin`, `rsdp`, `table_loader`, `boot_order`, `path_boot_xxxx`, `tdvf_before_202411`, …; MOK and `sbat_level` are not used) plus:
+
+- `qcow2` or `disk` / `rootfs`: as for indirect boot; the GPT is read from the disk.
+- `uki` *(optional, default `/boot/efi/EFI/BOOT/BOOTX64.EFI`)*: path of the UKI inside the guest filesystem (read from `qcow2`, or from under `rootfs` with `disk`).
+- `cmdline` *(optional)*: override for the UKI's `.cmdline` section. Firmware-created boot options (e.g. "UEFI Misc Device") pass no load options, so the stub uses `.cmdline`; set this only when the boot entry passes its own command line.
+- `initrd` *(optional)*: override path for the initrd measured by the kernel (default: the UKI's `.initrd` section).
+
+Measurements:
+- RTMR[1]: the GPT, the UKI's Authenticode hash, and the Authenticode hash of its `.linux` section (loaded by the stub).
+- RTMR[2]: the kernel command line (UTF-16, NUL-terminated, after systemd-stub's whitespace normalization) and the initrd, both measured by the Linux EFI stub. The normalization depends on the stub version, read from the UKI's `.sdmagic` section: all versions turn control characters into spaces and strip trailing spaces; v255 and newer also strip leading whitespace.
+
+The model matches systemd-stub before v256 without credentials, system extensions or add-ons (no measurements by the stub itself); it was validated against TDs booting UKIs built with systemd-stub 252 (veLinux, kernel 6.6) and 255. On mismatches, `--compare-eventlog` compares the UKI size and modification time against the image the firmware loaded, and lists the command-line candidates from `.cmdline` and `/proc/cmdline`.
+
 ### Transcript
 
 The transcript flag makes it possible to generate a human-readable transcript from the different binary configuration files. The command line tool `iasl` needs to be installed in order to disassembled the ACPI tables and include its representation in the transcript.
@@ -340,6 +359,9 @@ With this method, `OVMF` (the TDVF or virtual firmware) directly boots the kerne
 2) Indirect Boot:
 With this method, `tdvirsh` is used to run TDs, the boot chain is more complex and involves `OVMF`, a `SHIM`, `Grub`, and finally the `kernel`+`initrd` image.
 
+3) UKI Boot:
+`OVMF` boots a Unified Kernel Image from the disk's ESP; its systemd-stub starts the embedded kernel with the embedded `initrd` and `cmdline`.
+
 ### What goes in the measurements
 
 TDX attestation reports expose 4 measurement registers (MR).
@@ -356,6 +378,6 @@ Three other runtime measurement registers (`RTMR`) correspond to different boot 
 - Boot variables (BootOrder and others).
 - [for indirect boot only] [SbatLevel](https://github.com/rhboot/shim/blob/main/SbatLevel_Variable.txt) variable.
 
-`RTMR[1]` contains measurements of the `kernel` for direct boot. For indirect boot, it contains measurement for the bootchain a.k.a. `gpt` (GUID Partition Table), `shim`, and `grub`.
+`RTMR[1]` contains measurements of the `kernel` for direct boot. For indirect boot, it contains measurement for the bootchain a.k.a. `gpt` (GUID Partition Table), `shim`, and `grub`. For UKI boot, it contains the `gpt`, the UKI and its embedded kernel.
 
 `RTMR[2]` contains measurements of the kernel `cmdline` and `initrd` for direct boot. For indirect boot, it also contains the measurements of machine owner key [(MOK) variables](https://github.com/rhboot/shim/blob/main/MokVars.txt).
