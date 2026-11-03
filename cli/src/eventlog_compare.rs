@@ -176,7 +176,8 @@ fn dump_event(e: &Event) {
 
 const TDX_GUEST_DEVICE: &str = "/dev/tdx_guest";
 /// `_IOWR('T', 1, struct tdx_report_req)` from linux/tdx-guest.h.
-const TDX_CMD_GET_REPORT0: libc::c_ulong = 0xC440_5401;
+// The request type is c_ulong on glibc and c_int on musl.
+const TDX_CMD_GET_REPORT0: libc::Ioctl = 0xC440_5401_u32 as libc::Ioctl;
 const TDX_REPORTDATA_LEN: usize = 64;
 const TDX_REPORT_LEN: usize = 1024;
 /// TDINFO starts at 512 in the TDREPORT: ATTRIBUTES(8), XFAM(8), MRTD(48),
