@@ -316,8 +316,15 @@ pub fn rtmr1_log_from_image(source: &ImageSource, include_separator: bool, shim_
     // Extract bootloader files
     let gpt_data = extract_gpt_event_data(source)?;
     debug!("{}", describe_gpt_event_data(&gpt_data));
-    let shim_data = source.read_file("/boot/efi/EFI/ubuntu/shimx64.efi")?;
-    let grub_data = source.read_file("/boot/efi/EFI/ubuntu/grubx64.efi")?;
+    // Keep Ubuntu as the default, and read both bootloaders from veLinux's
+    // vendor directory when the Ubuntu shim is absent.
+    let efi_dir = if source.file_exists("/boot/efi/EFI/ubuntu/shimx64.efi")? {
+        "/boot/efi/EFI/ubuntu"
+    } else {
+        "/boot/efi/EFI/velinux"
+    };
+    let shim_data = source.read_file(&format!("{efi_dir}/shimx64.efi"))?;
+    let grub_data = source.read_file(&format!("{efi_dir}/grubx64.efi"))?;
 
     // Compute hashes of the bootloader components
     let gpt_hash = measure_sha384(&gpt_data);
@@ -381,6 +388,66 @@ pub fn rtmr2_log_from_image(source: &ImageSource, cmdline: &str, ref_mok_list: O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Small unsigned PE32+ image with one section and no certificate table.
+    fn bootloader_image(marker: u8) -> Vec<u8> {
+        let mut pe = vec![0u8; 1024];
+        pe[..2].copy_from_slice(b"MZ");
+        pe[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+        pe[0x44..0x46].copy_from_slice(&0x8664u16.to_le_bytes());
+        pe[0x46..0x48].copy_from_slice(&1u16.to_le_bytes());
+        pe[0x54..0x56].copy_from_slice(&240u16.to_le_bytes());
+        pe[0x58..0x5a].copy_from_slice(&0x20bu16.to_le_bytes());
+        pe[0x94..0x98].copy_from_slice(&512u32.to_le_bytes());
+        pe[0x148..0x150].copy_from_slice(b".text\0\0\0");
+        pe[0x158..0x15c].copy_from_slice(&512u32.to_le_bytes());
+        pe[0x15c..0x160].copy_from_slice(&512u32.to_le_bytes());
+        pe[512..].fill(marker);
+        pe
+    }
+
+    #[test]
+    fn indirect_boot_reads_ubuntu_and_velinux_bootloaders() {
+        // Independently hashed PE bytes, excluding the checksum and certificate directory.
+        let ubuntu_shim = "a42582e2ab431e6ba770e41a0ecce74d2dc8b9d568a0d41856185728cfa29ba2da9734069d975593ef9832f67b1805f4";
+        let ubuntu_grub = "a600934193a29b5a26ed84aec64546b5125b65a52a2eec17762487774d08eeb9efaf02ca388d271a29636253881a5869";
+        let velinux_shim = "c28211ff08e8adf9fc71b52b3e81bcbf478ec2d2032ddeeda761f7fde5760146c4b89282533f01ede6f1d6144ac5e99d";
+        let velinux_grub = "7575a62a0bc1138eeb87ec0d67a75c3a214e517a69ce0cd2c558f2e2c99fb51a67fe11fac9618af874f7535b7d7cbb07";
+        for (name, vendors, shim, grub) in [
+            ("ubuntu", &["ubuntu"][..], ubuntu_shim, ubuntu_grub),
+            ("velinux", &["velinux"][..], velinux_shim, velinux_grub),
+            ("both", &["ubuntu", "velinux"][..], ubuntu_shim, ubuntu_grub),
+        ] {
+            let dir = std::env::temp_dir().join(format!("tdx_measure_bootloaders_{}_{name}", std::process::id()));
+            fs_err::create_dir_all(&dir).unwrap();
+            for vendor in vendors {
+                let efi = dir.join("boot/efi/EFI").join(vendor);
+                fs_err::create_dir_all(&efi).unwrap();
+                let (shim_marker, grub_marker) = if *vendor == "ubuntu" { (0x11, 0x22) } else { (0x33, 0x44) };
+                fs_err::write(efi.join("shimx64.efi"), bootloader_image(shim_marker)).unwrap();
+                fs_err::write(efi.join("grubx64.efi"), bootloader_image(grub_marker)).unwrap();
+            }
+            let mut disk = vec![0u8; 512 * 3];
+            disk[512..520].copy_from_slice(b"EFI PART");
+            disk[584..592].copy_from_slice(&2u64.to_le_bytes());
+            disk[592..596].copy_from_slice(&4u32.to_le_bytes());
+            disk[596..600].copy_from_slice(&128u32.to_le_bytes());
+            disk[1024] = 0xaa;
+            let disk_path = dir.join("disk.raw");
+            fs_err::write(&disk_path, disk).unwrap();
+            let source = ImageSource::Local {
+                disk: disk_path.to_str().unwrap(),
+                rootfs: dir.to_str().unwrap(),
+            };
+            let result = rtmr1_log_from_image(&source, true, false);
+            let _ = fs_err::remove_dir_all(&dir);
+            let log = result.unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            assert_eq!(log.len(), 7, "{name}");
+            assert_eq!(hex::encode(&log[3]), shim, "{name}: shim");
+            assert_eq!(hex::encode(&log[4]), grub, "{name}: grub");
+        }
+    }
 
     #[test]
     fn local_source_reads_gpt_and_files() {
