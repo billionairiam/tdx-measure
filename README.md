@@ -241,6 +241,7 @@ Create `metadata.json` file with the below metadata:
     The file can be extracted by running the [`extract_config_files.py`](extract_config_files.py) script inside a TD, which is configured identically to the target configuration.
   - `sbat_level`: Path to file containing a SBAT (Secure Boot Advanced Targeting) revocation list.
     Used to revoke specific bootloader versions without revoking their signing keys.
+    Its contents are measured as shim's `SbatLevel` event in RTMR[0]; when omitted, shim's original level `sbat,1,2021030218\n` is assumed.
     The file can be extracted by running the [`extract_config_files.py`](extract_config_files.py) script inside a TD, which is configured identically to the target configuration.
 
 ### UKI Boot

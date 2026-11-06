@@ -167,6 +167,17 @@ pub(crate) fn load_option_has_file_path(data: &[u8]) -> bool {
 }
 
 /// Loads boot variable data if the corresponding file exists
+/// Digest of shim's SbatLevel EV_EFI_VARIABLE_AUTHORITY event. Uses the
+/// captured `SbatLevelRT` contents when given, else shim's original level.
+fn measure_sbat_level(sbat_level: Option<&str>) -> Result<Vec<u8>> {
+    const DEFAULT_SBAT_LEVEL: &[u8] = b"sbat,1,2021030218\n";
+    let data = match sbat_level {
+        Some(path) => read_file_data(path).context("Failed to read sbat_level")?,
+        None => DEFAULT_SBAT_LEVEL.to_vec(),
+    };
+    measure_tdx_efi_variable("605DAB50-E046-4300-ABB6-3DD810DD8B23", "SbatLevel", Some(&data))
+}
+
 pub(crate) fn load_boot_variable_if_exists(boot_entry_num: u16, machine: &Machine) -> Result<Option<Vec<u8>>> {
     let path_boot_xxxx = machine.measure_config.as_ref()
         .and_then(|mc| mc.path_boot_xxxx.as_deref())
@@ -397,9 +408,11 @@ impl<'a> Tdvf<'a> {
         // Add SbatLevel for indirect boot; shim measures it on every run, and
         // with fallback shim runs twice (BOOTX64.EFI, then shimx64.efi).
         if !machine.is_direct_boot() && !machine.is_uki_boot() {
+            let sbat_level = machine.measure_config.as_ref().and_then(|mc| mc.sbat_level.as_deref());
+            let sbat_event = measure_sbat_level(sbat_level)?;
             let shim_runs = if shim_fallback { 2 } else { 1 };
             for _ in 0..shim_runs {
-                rtmr0_log.push(measure_tdx_efi_variable("605DAB50-E046-4300-ABB6-3DD810DD8B23", "SbatLevel", Some(b"sbat,1,2021030218\n"))?);
+                rtmr0_log.push(sbat_event.clone());
             }
         }
 
@@ -566,6 +579,23 @@ mod tests {
         assert_eq!(
             hex::encode(tdvf.measure_td_hob(16 << 30, false).unwrap()),
             "cd2312a0d87ef3c4a928df87088969a80b33d7bf3fc584bdde637b09ed808a8d821a56b78a13a6eb506db7578444abbe"
+        );
+    }
+
+    #[test]
+    fn sbat_level_is_read_from_configured_file() {
+        // SbatLevel digests from TD event logs: veLinux shim and the default level.
+        let path = std::env::temp_dir().join(format!("tdx_measure_sbat_{}", std::process::id()));
+        fs_err::write(&path, b"sbat,1,2022052400\ngrub,2\n").unwrap();
+        let digest = measure_sbat_level(Some(path.to_str().unwrap()));
+        fs_err::remove_file(&path).unwrap();
+        assert_eq!(
+            hex::encode(digest.unwrap()),
+            "62bb1036f9eb758bb5e256c14d53a3c1f1497779ec8816e2163b48486e22d0b74fa18c3bc1f171711b7fbcc037eb8493"
+        );
+        assert_eq!(
+            hex::encode(measure_sbat_level(None).unwrap()),
+            "f143e2948d63fcd3442e841bb36a7e180871f0a8946541961fe9d12e70d0727874600956264dba531e2edd8729c5eb38"
         );
     }
 
