@@ -69,6 +69,7 @@ fn machine_for(fixture: &Path) -> Machine {
             secure_boot: None,
             shim_fallback: None,
             td_hob_mmio: false,
+            grub_measurement: false,
             boot_current: None,
             acpi_tables_bin: Some(String::new()),
             rsdp: None,

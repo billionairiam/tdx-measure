@@ -13,7 +13,7 @@ use crate::util::utf16_encode;
 
 /// Resolve the guestfish binary path via `which`, returning a clear error if
 /// it is not installed.
-fn guestfish_bin() -> Result<String> {
+pub(crate) fn guestfish_bin() -> Result<String> {
     let output = Command::new("which")
         .arg("guestfish")
         .output()
@@ -124,7 +124,7 @@ impl ImageSource<'_> {
     }
 
     /// Read `len` raw bytes at byte `offset` from the boot disk.
-    fn read_disk(&self, len: usize, offset: u64) -> Result<Vec<u8>> {
+    pub(crate) fn read_disk(&self, len: usize, offset: u64) -> Result<Vec<u8>> {
         match self {
             ImageSource::Qcow2(qcow2) => guestfish_pread_device(qcow2, len, offset),
             ImageSource::Local { disk, .. } => {
@@ -140,7 +140,7 @@ impl ImageSource<'_> {
     }
 }
 
-fn format_guid(b: &[u8]) -> String {
+pub(crate) fn format_guid(b: &[u8]) -> String {
     format!(
         "{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{}",
         u32::from_le_bytes(b[0..4].try_into().unwrap()),
@@ -310,19 +310,24 @@ fn extract_kernel_version_from_cmdline(cmdline: &str) -> Result<String> {
     bail!("Could not extract kernel version from command line: {}", cmdline);
 }
 
+/// Guest directory holding shim and GRUB. Keep Ubuntu as the default, and
+/// read both bootloaders from veLinux's vendor directory when the Ubuntu
+/// shim is absent.
+fn efi_dir(source: &ImageSource) -> Result<&'static str> {
+    Ok(if source.file_exists("/boot/efi/EFI/ubuntu/shimx64.efi")? {
+        "/boot/efi/EFI/ubuntu"
+    } else {
+        "/boot/efi/EFI/velinux"
+    })
+}
+
 /// RTMR1 event digests for indirect boot from a guest disk image
 pub fn rtmr1_log_from_image(source: &ImageSource, include_separator: bool, shim_fallback: bool) -> Result<Vec<Vec<u8>>> {
 
     // Extract bootloader files
     let gpt_data = extract_gpt_event_data(source)?;
     debug!("{}", describe_gpt_event_data(&gpt_data));
-    // Keep Ubuntu as the default, and read both bootloaders from veLinux's
-    // vendor directory when the Ubuntu shim is absent.
-    let efi_dir = if source.file_exists("/boot/efi/EFI/ubuntu/shimx64.efi")? {
-        "/boot/efi/EFI/ubuntu"
-    } else {
-        "/boot/efi/EFI/velinux"
-    };
+    let efi_dir = efi_dir(source)?;
     let shim_data = source.read_file(&format!("{efi_dir}/shimx64.efi"))?;
     let grub_data = source.read_file(&format!("{efi_dir}/grubx64.efi"))?;
 
@@ -360,27 +365,72 @@ pub fn initrd_guest_path(cmdline: &str) -> Result<String> {
     Ok(format!("/boot/initrd.img-{}", extract_kernel_version_from_cmdline(cmdline)?))
 }
 
+/// Files holding the MOK variables shim measures into RTMR2.
+pub struct MokVars<'a> {
+    pub mok_list: Option<&'a str>,
+    pub mok_list_trusted: Option<&'a str>,
+    pub mok_list_x: Option<&'a str>,
+}
+
+/// Shim's RTMR2 events. MOK variables are optional; skip any that are
+/// absent. Shim measures them on every run; with fallback it runs twice.
+fn mok_events(mok: &MokVars, shim_fallback: bool) -> Result<Vec<Vec<u8>>> {
+    let mut events = Vec::new();
+    for p in [mok.mok_list, mok.mok_list_x, mok.mok_list_trusted].into_iter().flatten() {
+        events.push(measure_sha384(&read_file_data(p)?));
+    }
+    if shim_fallback {
+        events.extend(events.clone());
+    }
+    Ok(events)
+}
+
 /// RTMR2 event digests using actual MOK variable data extracted from shim
-pub fn rtmr2_log_from_image(source: &ImageSource, cmdline: &str, ref_mok_list: Option<&str>, ref_mok_list_trusted: Option<&str>, ref_mok_list_x: Option<&str>, shim_fallback: bool) -> Result<Vec<Vec<u8>>> {
+pub fn rtmr2_log_from_image(source: &ImageSource, cmdline: &str, mok: &MokVars, shim_fallback: bool) -> Result<Vec<Vec<u8>>> {
 
     let initrd_path = initrd_guest_path(cmdline)?;
 
     // Extract initrd
     let initrd_data = source.read_file(&initrd_path)?;
 
-    // Compute RTMR2 log. MOK variables are optional; skip any that are absent.
-    // Shim measures them on every run; with fallback it runs twice.
-    let mut mok_events = Vec::new();
-    for p in [ref_mok_list, ref_mok_list_x, ref_mok_list_trusted].into_iter().flatten() {
-        mok_events.push(measure_sha384(&read_file_data(p)?));
-    }
-    let mut rtmr2_log = mok_events.clone();
-    if shim_fallback {
-        rtmr2_log.extend(mok_events);
-    }
+    let mut rtmr2_log = mok_events(mok, shim_fallback)?;
     rtmr2_log.push(measure_sha384(&utf16_encode(cmdline)));
     rtmr2_log.push(measure_sha384(&initrd_data));
 
+    debug_print_log("RTMR2", &rtmr2_log);
+    Ok(rtmr2_log)
+}
+
+/// RTMR2 event digests when GRUB measures its commands and files: shim's
+/// MOK events followed by the events of a replay of the GRUB boot flow.
+pub fn rtmr2_log_from_grub(source: &ImageSource, cmdline: Option<&str>, mok: &MokVars, shim_fallback: bool) -> Result<Vec<Vec<u8>>> {
+    use crate::grub::{GrubDisk, GrubImage, ImageDisk, Kind};
+
+    // Read GRUB from the ESP itself (not via /boot/efi, which may not be
+    // mounted), picking the vendor directory like `efi_dir`.
+    let mut disk = ImageDisk::open(source)?;
+    let esp = disk.esp().context("No EFI system partition found")?;
+    let fw_path = if disk.stat(esp, "/EFI/ubuntu/shimx64.efi")? == Some(Kind::File) {
+        "/EFI/ubuntu"
+    } else {
+        "/EFI/velinux"
+    };
+    let grub = disk
+        .read(esp, &format!("{fw_path}/grubx64.efi"))?
+        .with_context(|| format!("{fw_path}/grubx64.efi not found on the EFI system partition"))?;
+    let grub = GrubImage::parse(&grub).context("Failed to parse grubx64.efi")?;
+    let boot = crate::grub::simulate(&grub, &mut disk, esp, fw_path).context("Failed to replay the GRUB boot")?;
+    for e in &boot.events {
+        debug!("GRUB event {}: {}", hex::encode(e.digest()), e.description());
+    }
+    if let Some(cmdline) = cmdline.filter(|c| !c.is_empty() && *c != boot.kernel_cmdline()) {
+        log::warn!(
+            "GRUB boots with kernel command line `{}`, which differs from the configured `{cmdline}`",
+            boot.kernel_cmdline()
+        );
+    }
+    let mut rtmr2_log = mok_events(mok, shim_fallback)?;
+    rtmr2_log.extend(boot.events.iter().map(|e| e.digest()));
     debug_print_log("RTMR2", &rtmr2_log);
     Ok(rtmr2_log)
 }

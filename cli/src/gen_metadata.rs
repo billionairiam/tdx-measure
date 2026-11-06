@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use fs_err as fs;
 use qcparser::{Grouped, Props};
 use std::path::{Path, PathBuf};
-use tdx_measure::{Machine, MeasureConfig, QemuOptions};
+use tdx_measure::{eventlog, Machine, MeasureConfig, QemuOptions};
 
 const BIOS_PLACEHOLDER: &str = "[Path to OVMF.fd]";
 
@@ -83,6 +83,7 @@ fn machine_from_grouped(g: &Grouped, boot_mode: &str, tdvf_before_202411: bool) 
         secure_boot: None,
         shim_fallback: None,
         td_hob_mmio: false,
+        grub_measurement: false,
         boot_current: opt(indirect, "[Path to BootCurrent.bin]"),
         acpi_tables_bin: Some("[Path to acpi_tables_bin]".to_string()),
         rsdp: opt(disk_boot, "[Path to rsdp]"),
@@ -234,6 +235,7 @@ fn fill_from_guest(mc: &mut MeasureConfig, opts: &GuestOptions, src: &GuestSourc
 
     if !mc.is_uki_boot() {
         mc.cmdline = Some(fs::read_to_string(src.proc.join("cmdline"))?.trim().to_string());
+        mc.grub_measurement = grub_measures_commands(src);
     }
     let disk = match opts.disk.clone().or_else(|| detect_boot_disk(src)) {
         Some(disk) => disk,
@@ -246,6 +248,21 @@ fn fill_from_guest(mc: &mut MeasureConfig, opts: &GuestOptions, src: &GuestSourc
     mc.rootfs = Some(opts.rootfs.clone());
     mc.qcow2 = None;
     Ok(())
+}
+
+/// True if this boot's CCEL holds GRUB command events (`grub_cmd: ...`
+/// EV_IPL events in RTMR2), i.e. GRUB measured its commands and files.
+fn grub_measures_commands(src: &GuestSources) -> bool {
+    const EV_IPL: u32 = 0xd;
+    let ccel = src.sys.join("firmware/acpi/tables/data/CCEL");
+    let events = match fs::read(&ccel).map_err(anyhow::Error::from).and_then(|log| eventlog::parse_ccel(&log)) {
+        Ok(events) => events,
+        Err(e) => {
+            eprintln!("warning: cannot read the event log ({e:#}); set measure_config.grub_measurement by hand");
+            return false;
+        }
+    };
+    events.iter().any(|e| e.mr_index == 3 && e.event_type == EV_IPL && e.data.starts_with(b"grub_cmd: "))
 }
 
 /// Return the whole-disk device (e.g. `/dev/vda`) backing the ESP at `/boot/efi`.
@@ -326,6 +343,29 @@ mod tests {
         assert_eq!(mc.cmdline.as_deref(), Some("BOOT_IMAGE=/vmlinuz ro"));
         assert_eq!(mc.disk.as_deref(), Some("/dev/vda"));
         assert_eq!(mc.qcow2, None);
+        assert!(!mc.grub_measurement);
+
+        // A CCEL with a GRUB command event in RTMR2 enables grub_measurement.
+        let mut spec = b"Spec ID Event03\0".to_vec();
+        spec.extend([0, 0, 0, 0, 0, 2, 0, 2]);
+        spec.extend(1u32.to_le_bytes());
+        spec.extend([0x0c, 0, 48, 0, 0]); // SHA-384, 48 bytes, no vendor info
+        let mut ccel = [0u32.to_le_bytes(), 3u32.to_le_bytes()].concat();
+        ccel.extend([0u8; 20]);
+        ccel.extend((spec.len() as u32).to_le_bytes());
+        ccel.extend(spec);
+        let data = b"grub_cmd: insmod gzio";
+        for v in [3u32, 0xd, 1] {
+            ccel.extend(v.to_le_bytes());
+        }
+        ccel.extend([0x0c, 0]);
+        ccel.extend([0u8; 48]);
+        ccel.extend((data.len() as u32).to_le_bytes());
+        ccel.extend(data);
+        write(sources.sys.join("firmware/acpi/tables/data/CCEL"), &ccel);
+        run_with(&root.join("command"), "indirect", true, &meta, Some(&opts), &sources).unwrap();
+        let machine: Machine = serde_json::from_str(&fs::read_to_string(&meta).unwrap()).unwrap();
+        assert!(machine.measure_config.unwrap().grub_measurement);
 
         fs::remove_file(work.join("BootCurrent.bin")).unwrap();
         run_with(&root.join("command"), "indirect", true, &meta, Some(&opts), &sources).unwrap();

@@ -305,9 +305,12 @@ impl Machine {
             let cmdline = mc.cmdline.as_deref().unwrap_or("");
 
             let rtmr1 = image::rtmr1_log_from_image(&source, rtmr1_separator, shim_fallback)?;
-            let rtmr2 = image::rtmr2_log_from_image(
-                &source, cmdline, mok_list, mok_list_trusted, mok_list_x, shim_fallback,
-            )?;
+            let mok = image::MokVars { mok_list, mok_list_trusted, mok_list_x };
+            let rtmr2 = if mc.grub_measurement {
+                image::rtmr2_log_from_grub(&source, mc.cmdline.as_deref(), &mok, shim_fallback)?
+            } else {
+                image::rtmr2_log_from_image(&source, cmdline, &mok, shim_fallback)?
+            };
             Ok((rtmr1, rtmr2))
         }
     }

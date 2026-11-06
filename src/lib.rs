@@ -15,6 +15,7 @@ use util::{measure_log, measure_sha384};
 
 mod acpi;
 pub mod eventlog;
+pub mod grub;
 mod kernel;
 mod image;
 mod machine;
@@ -131,6 +132,13 @@ pub struct MeasureConfig {
     /// downstream TDX QEMU builds do. Defaults to false (upstream QEMU).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub td_hob_mmio: bool,
+    /// Indirect boot: GRUB measures every command it runs, the kernel
+    /// command line and every file it opens into RTMR2 (GRUB's TPM verifier,
+    /// as in Debian/veLinux builds). RTMR2 is then predicted by replaying the
+    /// GRUB configuration from the image instead of from `cmdline` and the
+    /// initrd. Defaults to false (Ubuntu-style shim/GRUB).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub grub_measurement: bool,
     /// Path to the captured `BootCurrent` variable (in-guest measurement).
     #[serde(default, skip_serializing_if = "is_none_or_empty")]
     pub boot_current: Option<String>,
