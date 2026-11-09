@@ -23,19 +23,34 @@ const IMAGE_NAME: &str = "acpi-tables-generator";
 const OVMF_IN_CONTAINER: &str = "/usr/share/ovmf/OVMF.fd";
 
 
+/// Pinned upstream QEMU release used by the `upstream` source, and the SHA-256
+/// of its `download.qemu.org` tarball. 8.1 is what TDX hosts built on the
+/// Intel TDX QEMU 8.1 tree (`pc-q35-8.1`) run.
+const UPSTREAM_QEMU_VERSION: &str = "8.1.5";
+const UPSTREAM_QEMU_SHA256: &str = "9763b1efec4fd49796b5080d0883512d70cb6389ead65c661cc3686a52232896";
+
 /// Describes how to fetch the QEMU source package for a given distribution.
 struct QemuPkg<'a> {
     /// `ppa` -> `pull-ppa-source --ppa ppa:kobuk-team/tdx-release qemu $VERSION`
     /// `main` -> `pull-lp-source qemu $VERSION` (or latest in main when empty)
+    /// `upstream` -> `qemu-$VERSION.tar.xz` from download.qemu.org
     source: &'static str,
     /// Version handed to the source fetcher. Empty string == "let the fetcher
     /// pick the current main-archive version" (only meaningful for `main`).
     version: &'a str,
+    /// Expected SHA-256 of the upstream tarball; empty skips verification.
+    sha256: &'static str,
+    /// Port the Intel TDX edge-trigger ACPI patch into sources that lack it.
+    tdx_edge_trigger: bool,
     /// Immutable OCI digest of the base image (`sha256:...`).
     image_digest: &'static str,
 }
 
-fn qemu_pkg_for<'a>(distribution: &str, version_override: Option<&'a str>) -> Result<QemuPkg<'a>> {
+fn qemu_pkg_for<'a>(
+    distribution: &str,
+    source_override: Option<&str>,
+    version_override: Option<&'a str>,
+) -> Result<QemuPkg<'a>> {
     // Pinned defaults for reproducibility; override via `--qemu-version`.
     let (source, default_version, image_digest): (&'static str, &'static str, &'static str) = match distribution {
         "ubuntu:24.04" => (
@@ -54,14 +69,30 @@ fn qemu_pkg_for<'a>(distribution: &str, version_override: Option<&'a str>) -> Re
             "sha256:f3d28607ddd78734bb7f71f117f3c6706c666b8b76cbff7c9ff6e5718d46ff64",
         ),
         other => bail!(
-            "Unsupported distribution: {other}. Supported: ubuntu:25.04, ubuntu:26.04"
+            "Unsupported distribution: {other}. Supported: ubuntu:24.04, ubuntu:25.04, ubuntu:26.04"
         ),
     };
-    Ok(QemuPkg {
-        source,
-        version: version_override.unwrap_or(default_version),
-        image_digest,
-    })
+    match source_override {
+        None => Ok(QemuPkg {
+            source,
+            version: version_override.unwrap_or(default_version),
+            sha256: "",
+            tdx_edge_trigger: false,
+            image_digest,
+        }),
+        Some("upstream") => {
+            let version = version_override.unwrap_or(UPSTREAM_QEMU_VERSION);
+            if version.is_empty() {
+                bail!("--qemu-source upstream needs a QEMU release version (e.g. {UPSTREAM_QEMU_VERSION})");
+            }
+            let sha256 = if version == UPSTREAM_QEMU_VERSION { UPSTREAM_QEMU_SHA256 } else { "" };
+            if sha256.is_empty() {
+                warn!("No pinned checksum for upstream QEMU {version}; tarball will not be verified");
+            }
+            Ok(QemuPkg { source: "upstream", version, sha256, tdx_edge_trigger: true, image_digest })
+        }
+        Some(other) => bail!("Unsupported QEMU source: {other}. Supported: upstream"),
+    }
 }
 
 /// Builds the QEMU command line that the patched in-container QEMU will run to
@@ -434,8 +465,28 @@ fn build_qemu_args(qo: &QemuOptions) -> Vec<OsString> {
     args
 }
 
-/// Returns the host's `kvm` group id, if the group exists. Used to grant the
-/// container access to `/dev/kvm` and `/dev/vhost-vsock`.
+/// Group ids that grant the container access to the passed-through
+/// `/dev/kvm` and `/dev/vhost-vsock`: each device's owning group (which need not
+/// be `kvm`, e.g. when udev rules assign another group), falling back to the
+/// host's `kvm` group when neither device exists.
+fn device_group_ids() -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut gids: Vec<String> = Vec::new();
+    for dev in ["/dev/kvm", "/dev/vhost-vsock"] {
+        if let Ok(meta) = fs_err::metadata(dev) {
+            let gid = meta.gid().to_string();
+            if meta.gid() != 0 && !gids.contains(&gid) {
+                gids.push(gid);
+            }
+        }
+    }
+    if gids.is_empty() {
+        gids.extend(kvm_group_id());
+    }
+    gids
+}
+
+/// Returns the host's `kvm` group id, if the group exists.
 fn kvm_group_id() -> Option<String> {
     let out = Command::new("getent").args(["group", "kvm"]).output().ok()?;
     if !out.status.success() {
@@ -466,6 +517,10 @@ fn build_docker_image(
             "QEMU source: {distribution} main archive ({})",
             if pkg.version.is_empty() { "latest" } else { pkg.version }
         ),
+        "upstream" => info!(
+            "QEMU source: upstream qemu-{}.tar.xz with TDX edge-trigger ACPI patch on {distribution}",
+            pkg.version
+        ),
         other => info!(
             "QEMU source: {other} ({})",
             if pkg.version.is_empty() { "?" } else { pkg.version }
@@ -479,6 +534,8 @@ fn build_docker_image(
         .arg("--build-arg").arg(format!("DISTRIBUTION={pinned_image}"))
         .arg("--build-arg").arg(format!("QEMU_SOURCE={}", pkg.source))
         .arg("--build-arg").arg(format!("QEMU_VERSION={}", pkg.version))
+        .arg("--build-arg").arg(format!("QEMU_SHA256={}", pkg.sha256))
+        .arg("--build-arg").arg(format!("TDX_EDGE_TRIGGER={}", u8::from(pkg.tdx_edge_trigger)))
         .arg("--build-arg").arg(format!("ACPI_TABLES={acpi_tables}"))
         .arg("--build-arg").arg(format!("ACPI_LOADER={acpi_loader}"))
         .arg("--build-arg").arg(format!("ACPI_RSDP={acpi_rsdp}"));
@@ -527,9 +584,7 @@ fn run_docker_container(
     let mut cmd = Command::new("docker");
     cmd.args(["run", "--rm", "--name", CONTAINER_NAME]);
 
-    // The `kvm` group also owns `/dev/vhost-vsock` on Linux, so add it whenever
-    // either device matters.
-    if let Some(gid) = kvm_group_id() {
+    for gid in device_group_ids() {
         cmd.arg("--group-add").arg(gid);
     }
     if need_kvm {
@@ -565,9 +620,10 @@ pub fn generate_acpi_tables(
     acpi_rsdp_bin: &str,
     acpi_loader: &str,
     distribution: &str,
+    qemu_source: Option<&str>,
     qemu_version: Option<&str>,
 ) -> Result<()> {
-    let pkg = qemu_pkg_for(distribution, qemu_version)?;
+    let pkg = qemu_pkg_for(distribution, qemu_source, qemu_version)?;
 
     let bios = Path::new(&qemu_options.bios)
         .canonicalize()
@@ -658,13 +714,13 @@ mod tests {
 
     #[test]
     fn qemu_pkg_for_known_distros_returns_pinned_defaults() {
-        let p = qemu_pkg_for("ubuntu:25.04", None).unwrap();
+        let p = qemu_pkg_for("ubuntu:25.04", None, None).unwrap();
         assert_eq!(p.source, "ppa");
         assert_eq!(p.version, "1:9.2.1+ds-1ubuntu4+tdx2.0~ppa2");
         assert!(p.image_digest.starts_with("sha256:"));
         assert_eq!(p.image_digest.len(), "sha256:".len() + 64);
 
-        let p = qemu_pkg_for("ubuntu:26.04", None).unwrap();
+        let p = qemu_pkg_for("ubuntu:26.04", None, None).unwrap();
         assert_eq!(p.source, "main");
         assert_eq!(p.version, "1:10.2.1+ds-1ubuntu4");
         assert!(p.image_digest.starts_with("sha256:"));
@@ -673,19 +729,36 @@ mod tests {
 
     #[test]
     fn qemu_pkg_for_honors_version_override() {
-        let p = qemu_pkg_for("ubuntu:26.04", Some("1:10.3.0-1ubuntu1")).unwrap();
+        let p = qemu_pkg_for("ubuntu:26.04", None, Some("1:10.3.0-1ubuntu1")).unwrap();
         assert_eq!(p.source, "main");
         assert_eq!(p.version, "1:10.3.0-1ubuntu1");
 
         // Even an empty override (caller asked for "latest") wins over the pin.
-        let p = qemu_pkg_for("ubuntu:26.04", Some("")).unwrap();
+        let p = qemu_pkg_for("ubuntu:26.04", None, Some("")).unwrap();
         assert_eq!(p.version, "");
     }
 
     #[test]
+    fn qemu_pkg_for_upstream_pins_tarball_and_enables_edge_trigger() {
+        let p = qemu_pkg_for("ubuntu:24.04", Some("upstream"), None).unwrap();
+        assert_eq!(p.source, "upstream");
+        assert_eq!(p.version, UPSTREAM_QEMU_VERSION);
+        assert_eq!(p.sha256, UPSTREAM_QEMU_SHA256);
+        assert!(p.tdx_edge_trigger);
+
+        // Unpinned releases build unverified; ppa/main sources never get the port.
+        let p = qemu_pkg_for("ubuntu:24.04", Some("upstream"), Some("8.1.4")).unwrap();
+        assert_eq!(p.sha256, "");
+        assert!(!qemu_pkg_for("ubuntu:24.04", None, None).unwrap().tdx_edge_trigger);
+
+        assert!(qemu_pkg_for("ubuntu:24.04", Some("upstream"), Some("")).is_err());
+        assert!(qemu_pkg_for("ubuntu:24.04", Some("git"), None).is_err());
+    }
+
+    #[test]
     fn qemu_pkg_for_rejects_unknown_distro() {
-        assert!(qemu_pkg_for("debian:12", None).is_err());
-        assert!(qemu_pkg_for("", None).is_err());
+        assert!(qemu_pkg_for("debian:12", None, None).is_err());
+        assert!(qemu_pkg_for("", None, None).is_err());
     }
 
     #[test]

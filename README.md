@@ -162,6 +162,23 @@ tdx-measure gen-acpi <METADATA> --distribution ubuntu:26.04 --qemu-version 1:10.
 tdx-measure gen-acpi <METADATA> --distribution ubuntu:26.04 --qemu-version ""                   # current main-archive tip
 ```
 
+Hosts running the Intel TDX QEMU 8.1 tree (`-machine pc-q35-8.1`, ACPI with an
+RSDT and edge-triggered legacy IRQs) have no matching distribution package. Use
+`--qemu-source upstream` to build the download.qemu.org release (pinned
+`8.1.5`, checksum-verified) on the distribution's base image, with Intel's
+"forcibly report edge trigger in acpi tables" patch ported in:
+
+```
+tdx-measure gen-acpi <METADATA> --distribution ubuntu:24.04 --qemu-source upstream
+```
+
+The dumper boots OVMF outside a TD, so OVMF sizes the 64-bit PCI window from
+CPUID phys-bits instead of the TD HOB, which can move the DSDT `QWordMemory`
+window. For older OVMF builds that ignore `X-PciMmio64Mb` on that path, add
+`host-phys-bits=off,phys-bits=40` to `qemu_options.cpu` and
+`name=opt/ovmf/X-PciMmio64Mb,string=0` to `qemu_options.fw_cfg` to get the
+window the TD sees.
+
 The dumper itself lives in the standalone `acpi-dump` library crate; the core
 `tdx-measure` measurement library carries no Docker/process dependencies.
 

@@ -7,8 +7,14 @@ FROM ${DISTRIBUTION}
 # QEMU_SOURCE selects how the source tarball is fetched:
 #   "ppa"  -> pull-ppa-source from ppa:kobuk-team/tdx-release (Intel TDX QEMU build for 24.04/25.04)
 #   "main" -> pull-lp-source from the distribution's main archive
+#   "upstream" -> qemu-${QEMU_VERSION}.tar.xz from download.qemu.org, checked
+#                 against QEMU_SHA256 when set
 ARG QEMU_SOURCE=ppa
 ARG QEMU_VERSION=
+ARG QEMU_SHA256=
+# When 1, port Intel's TDX "forcibly report edge trigger in acpi tables" patch
+# for sources that lack it (eoi_intercept_unsupported), as TDX QEMU builds do.
+ARG TDX_EDGE_TRIGGER=0
 ARG ACPI_TABLES
 ARG ACPI_LOADER
 ARG ACPI_RSDP
@@ -28,6 +34,18 @@ RUN apt-get update && \
         meson \
         ninja-build \
         python3-venv && \
+    if [ "$QEMU_SOURCE" = "upstream" ]; then \
+        apt-get install --no-install-recommends --yes \
+            ca-certificates \
+            curl \
+            xz-utils \
+            flex \
+            bison \
+            pkg-config \
+            libpixman-1-dev \
+            zlib1g-dev \
+            python3-tomli; \
+    fi && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -36,6 +54,10 @@ RUN if [ "$QEMU_SOURCE" = "ppa" ]; then \
         pull-ppa-source --ppa ppa:kobuk-team/tdx-release qemu ${QEMU_VERSION}; \
     elif [ "$QEMU_SOURCE" = "main" ]; then \
         pull-lp-source qemu ${QEMU_VERSION}; \
+    elif [ "$QEMU_SOURCE" = "upstream" ]; then \
+        curl -fsSLo /qemu.tar.xz "https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz" && \
+        if [ -n "$QEMU_SHA256" ]; then echo "$QEMU_SHA256  /qemu.tar.xz" | sha256sum -c -; fi && \
+        tar -xf /qemu.tar.xz -C / && rm /qemu.tar.xz; \
     else \
         echo "Unknown QEMU_SOURCE: $QEMU_SOURCE"; exit 1; \
     fi
@@ -94,6 +116,17 @@ EOF
 RUN perl -i -0pe 'BEGIN { local $/; open my $fh, "<", "/tmp/acpi-dump-inject.c" or die $!; $inject = <$fh>; } s{(acpi_build_update\(void \*build_opaque\)[\s\S]*?acpi_build\([^;]*;)}{$1 . $inject}egs' "$acpi_build_c" && \
     perl -i -pe 's/x86ms->eoi_intercept_unsupported;/1;/g' "$acpi_build_c" "$acpi_common_c" && \
     perl -i -pe "s/^(\s*)(subdir\('pc-bios'\)|subdir\('tests'\))/\1# \2/g" "$meson_build"
+
+# Edge-trigger port: _PRS/_CRS interrupts of the LNK*/GSI* links become Edge, and
+# the MADT reports IRQ 0->2 and identity overrides for IRQ 1-15 (plus the
+# secondary IOAPIC's IRQs) as edge/active-high. Fails the build if the source
+# layout does not match, rather than silently emitting level-triggered tables.
+RUN if [ "$TDX_EDGE_TRIGGER" = "1" ] && ! grep -q eoi_intercept_unsupported "$acpi_build_c"; then \
+        perl -i -pe 's/aml_interrupt\(AML_CONSUMER, AML_LEVEL/aml_interrupt(AML_CONSUMER, AML_EDGE/' "$acpi_build_c" && \
+        perl -i -0pe 's{    if \(x86ms->apic_xrupt_override\) \{\n.*?\n    \}\n\n    for \(i = 1; i < 16; i\+\+\) \{.*?\n    \}\n}{    if (x86ms->apic_xrupt_override) {\n        build_xrupt_override(table_data, 0, 2, 1 | (1 << 2));\n    }\n    for (i = x86ms->apic_xrupt_override ? 1 : 0; i < 16; i++) {\n        build_xrupt_override(table_data, i, i, 1 | (1 << 2));\n    }\n    if (x86ms->ioapic2) {\n        for (i = 0; i < 16; i++) {\n            build_xrupt_override(table_data, IO_APIC_SECONDARY_IRQBASE + i,\n                                 IO_APIC_SECONDARY_IRQBASE + i, 1 | (1 << 2));\n        }\n    }\n}s' "$acpi_common_c" && \
+        ! grep -q "AML_CONSUMER, AML_LEVEL" "$acpi_build_c" && \
+        grep -q "IO_APIC_SECONDARY_IRQBASE + i, 1 | (1 << 2)" "$acpi_common_c"; \
+    fi
 
 # Configure QEMU with minimal features to reduce build time and image size - only KVM acceleration is needed for ACPI table generation
 RUN ./configure \

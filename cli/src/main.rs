@@ -96,8 +96,15 @@ enum Commands {
         /// Supported: ubuntu:24.04, ubuntu:25.04, ubuntu:26.04.
         #[arg(long, value_name = "DISTRIBUTION", value_parser = ["ubuntu:24.04", "ubuntu:25.04", "ubuntu:26.04"])]
         distribution: String,
+        /// Build QEMU from another source instead of the distribution's
+        /// package. `upstream`: the download.qemu.org release (default 8.1.5)
+        /// with Intel's TDX edge-trigger ACPI patch ported in, for hosts running
+        /// the Intel TDX QEMU 8.1 tree. The distribution supplies the base image.
+        #[arg(long, value_name = "SOURCE", value_parser = ["upstream"])]
+        qemu_source: Option<String>,
         /// Override the pinned QEMU source-package version. Defaults to the
         /// distribution's pinned version. Pass "" to use the current main-archive pick.
+        /// With `--qemu-source upstream`, an upstream release such as 8.1.5.
         #[arg(long, value_name = "QEMU_VERSION")]
         qemu_version: Option<String>,
     },
@@ -138,7 +145,12 @@ fn run_measure(args: &MeasureArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_gen_acpi(metadata: &Path, distribution: &str, qemu_version: &Option<String>) -> Result<()> {
+fn run_gen_acpi(
+    metadata: &Path,
+    distribution: &str,
+    qemu_source: &Option<String>,
+    qemu_version: &Option<String>,
+) -> Result<()> {
     let machine = Machine::from_metadata_file(metadata)?;
     machine.validate()?;
     let qemu_options = machine
@@ -169,6 +181,7 @@ fn run_gen_acpi(metadata: &Path, distribution: &str, qemu_version: &Option<Strin
         acpi_rsdp_bin,
         acpi_tables_loader,
         distribution,
+        qemu_source.as_deref(),
         qemu_version.as_deref(),
     )
     .context("Failed to generate ACPI tables")?;
@@ -211,8 +224,8 @@ fn main() -> Result<()> {
             });
             gen_metadata::run(qemu_command, boot_mode, !*tdvf_after_202411, output, guest.as_ref())?;
         }
-        Some(Commands::GenAcpi { metadata, distribution, qemu_version }) => {
-            run_gen_acpi(metadata, distribution, qemu_version)?;
+        Some(Commands::GenAcpi { metadata, distribution, qemu_source, qemu_version }) => {
+            run_gen_acpi(metadata, distribution, qemu_source, qemu_version)?;
         }
         Some(Commands::Measure(args)) => run_measure(args)?,
         None => run_measure(&cli.measure)?,
